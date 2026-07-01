@@ -1,0 +1,46 @@
+name: Private module auth
+description: >-
+  Mint a short-lived GitHub App installation token (coderaxis-module-reader)
+  and configure git so `go mod download` / `git` can read private modules for
+  the given owner over HTTPS. Replaces long-lived PATs (CROSS_REPO_TOKEN /
+  WORKFLOW_GH_PAT). The token expires in ~1 hour.
+
+inputs:
+  app-id:
+    description: "GitHub App ID (pass secrets.CODERAXIS_APP_ID)"
+    required: true
+  private-key:
+    description: "GitHub App private key PEM (pass secrets.CODERAXIS_APP_PRIVATE_KEY)"
+    required: true
+  owner:
+    description: "Account whose private modules are read (installation to mint against)"
+    required: false
+    default: coderaxis
+
+outputs:
+  token:
+    description: "Short-lived installation token (use for extra git/gh calls if needed)"
+    value: ${{ steps.app-token.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mint installation token
+      id: app-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner }}
+
+    - name: Configure git for private module access
+      shell: bash
+      env:
+        MOD_TOKEN: ${{ steps.app-token.outputs.token }}
+        OWNER: ${{ inputs.owner }}
+      run: |
+        set -euo pipefail
+        git config --global \
+          url."https://x-access-token:${MOD_TOKEN}@github.com/${OWNER}/".insteadOf \
+          "https://github.com/${OWNER}/"
+        echo "Configured short-lived App token for github.com/${OWNER}/ (expires ~1h)"
