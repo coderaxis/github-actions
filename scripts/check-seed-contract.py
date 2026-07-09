@@ -6,7 +6,16 @@ Language-agnostic enforcement of the enterprise seeding standard
 service violates the contract. Stateless services (no cmd/seed and no seed data
 tree) are skipped with exit 0 so this can run fleet-wide.
 
-Checks (each an independent failure):
+Service classes (auto-detected):
+  * stateless          — no cmd/seed and no seed tree            -> skip (exit 0)
+  * file-based seeder   — ships a <...>/seed/data tree           -> FULL contract
+  * delegated seeder    — cmd/seed pulls data from an external
+                          *-core-postgres/seed module (SSOT in
+                          that repo; enforced there)             -> marker only
+  * code-only seeder    — cmd/seed seeds programmatically
+                          (SQL/generated), ships no JSON tree     -> marker only
+
+Full contract (file-based seeders):
   1. Dockerfile carries the marker  # seed binary path: /app/<binary>
   2. Dockerfile copies the seed data tree into the runtime image
   3. The seed data tree exists with canonical subdirs:
@@ -14,6 +23,10 @@ Checks (each an independent failure):
   4. Files under staging/ preprod/ prod/ are placeholders:
         a JSON array whose every object has only the key "comment"
   5. deploy-reusable.yml (if present) has no  SEED_COMMAND=""  override
+
+Marker-only contract (delegated / code-only seeders): the seed binary must be
+built and shipped, so the Dockerfile marker (check 1) is still required — the
+file-tree checks (2-4) do not apply because the data SSOT is not in this repo.
 
 This is the single-repo enforcement twin of the seeding standard's §6b.
 
@@ -49,6 +62,37 @@ def find_seed_data_dir(root: Path) -> Path | None:
 
 def is_stateful(root: Path, data_dir: Path | None) -> bool:
     return (root / "cmd" / "seed").is_dir() or data_dir is not None
+
+
+def cmd_seed_delegates(root: Path) -> bool:
+    """True if cmd/seed imports an external *-core-postgres/seed package.
+
+    Those services keep their seed data SSOT in the shared core-postgres module
+    (enforced by the seed-contract check running in *that* repo), so this repo
+    legitimately has no local seed/data tree.
+    """
+    seed_dir = root / "cmd" / "seed"
+    if not seed_dir.is_dir():
+        return False
+    for gf in seed_dir.glob("*.go"):
+        txt = gf.read_text(encoding="utf-8", errors="replace")
+        if re.search(r'"[^"]*-core-postgres/seed"', txt):
+            return True
+    return False
+
+
+def check_marker_only(root: Path, errors: list[str]) -> None:
+    """For delegated / code-only seeders: only require the built+shipped binary."""
+    dockerfile = root / "Dockerfile"
+    if not dockerfile.is_file():
+        errors.append("Dockerfile: missing (a stateful service must ship one)")
+        return
+    text = dockerfile.read_text(encoding="utf-8", errors="replace")
+    if not SEED_MARKER.search(text):
+        errors.append(
+            "Dockerfile: missing marker '# seed binary path: /app/<binary>' "
+            "(the seed binary must be built and shipped to run as an Argo PreSync hook)"
+        )
 
 
 def check_dockerfile(root: Path, data_dir: Path | None, errors: list[str]) -> None:
@@ -138,6 +182,29 @@ def main() -> int:
         return 0
 
     errors: list[str] = []
+
+    if data_dir is None:
+        # No local file-based seed data tree, but cmd/seed exists. Either the data
+        # SSOT lives in an external core-postgres module (delegated) or the seeder
+        # is programmatic (code-only). Only the built+shipped binary is enforced
+        # here; the file-tree contract does not apply.
+        kind = (
+            "delegated (external *-core-postgres/seed module owns the data SSOT)"
+            if cmd_seed_delegates(root)
+            else "code-only (programmatic seeder; no file-based seed data)"
+        )
+        check_marker_only(root, errors)
+        if errors:
+            print("::group::seed-contract violations")
+            for e in errors:
+                print(f"::error::{e}")
+            print("::endgroup::")
+            print(f"seed-contract: FAILED with {len(errors)} violation(s). [{kind}]")
+            return 1
+        print(f"seed-contract: OK ({kind}; enforced seed-binary marker only).")
+        return 0
+
+    # File-based seeder: enforce the full contract.
     check_dockerfile(root, data_dir, errors)
     check_tree(data_dir, errors)
     check_placeholders(data_dir, errors)
@@ -151,8 +218,8 @@ def main() -> int:
         print(f"seed-contract: FAILED with {len(errors)} violation(s).")
         return 1
 
-    rel = data_dir.relative_to(root) if data_dir else "(none)"
-    print(f"seed-contract: OK (data tree at {rel}).")
+    rel = data_dir.relative_to(root)
+    print(f"seed-contract: OK (file-based; data tree at {rel}).")
     return 0
 
 
