@@ -1,0 +1,319 @@
+name: Reusable Deploy (canonical build + dev pin)
+
+# Central, single-source delivery workflow for the InboxxHQ GitOps platform.
+# Consumed by every service/gateway/frontend repo via a ~12-line caller:
+#
+#   jobs:
+#     deploy:
+#       uses: coderaxis/github-actions/.github/workflows/deploy-reusable.yml@v1
+#       with: { service_name: auth-service }
+#       secrets: inherit
+#
+# Model (RFC-0020 / ADR-0051 — build once, deploy the digest):
+#   CI does NOT build. The self-hosted runners have no Docker daemon and are not
+#   a publish identity. CI orchestrates the single central build executor
+#   (inboxxhq-build CodeBuild): it uploads the immutable source revision, starts
+#   the build, and reads back the signed image DIGEST. The build pushes ONCE to
+#   the central immutable registry (SBOM + provenance + cosign attestations).
+#
+#   Dev is merely the FIRST CONSUMER of that digest (pinned into the dev overlay
+#   in the infra repo). staging / preprod / prod are NEVER built here — the
+#   Promotion Controller promotes the identical digest, gated on Argo CD health.
+#   There is no per-environment rebuild path anywhere.
+#
+# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2.
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Logical service name (overlay dir + image repo suffix), e.g. auth-service."
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region of the canonical build + central registry."
+        required: false
+        type: string
+        default: us-east-1
+      ci_build_role_arn:
+        description: "GitHub-OIDC ci-build orchestrator role (start CodeBuild, upload source, read digest). No image push, no cluster, no deploy role."
+        required: false
+        type: string
+        default: arn:aws:iam::063088900996:role/inboxxhq-ci-build
+      build_project:
+        description: "Canonical build CodeBuild project (environments/management/build). The sole publish identity."
+        required: false
+        type: string
+        default: inboxxhq-build
+      infra_repo:
+        description: "GitOps infra repo whose dev overlay this pins (owner/name)."
+        required: false
+        type: string
+        default: InboxxHQ-CoderAxis/inboxxhq-infra
+      contract_repo:
+        description: "API contract registry used by the deploy-time breaking-change gate (owner/name)."
+        required: false
+        type: string
+        default: InboxxHQ-CoderAxis/inboxxhq-api-contracts
+      module_release_env:
+        description: "Environment name passed to scripts/check_core_module_versions.sh (strictest env the artifact is promoted to)."
+        required: false
+        type: string
+        default: prod
+      runner:
+        description: "runs-on labels as a JSON array string."
+        required: false
+        type: string
+        default: '["self-hosted", "linux", "x64", "inboxxhq-deploy"]'
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC — assume the ci-build orchestrator role (no long-lived keys)
+
+concurrency:
+  group: inboxxhq-${{ inputs.service_name }}-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-gate:
+    name: Contract Gate (breaking-change detection)
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+
+      - name: Preflight (contract + token availability)
+        id: preflight
+        shell: bash
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The gate only applies to OpenAPI services. Gateways/frontends without a
+          # committed spec are skipped rather than failed.
+          if [[ ! -f docs/openapi.json ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No docs/openapi.json — not an OpenAPI service; skipping contract gate"
+          elif [[ -z "${CROSS_REPO_TOKEN}" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::module token unavailable — skipping contract breaking-change check"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch published contract from registry
+        if: steps.preflight.outputs.run == 'true'
+        shell: bash
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -sSL \
+            -H "Authorization: Bearer ${CROSS_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${{ inputs.contract_repo }}/contents/${{ inputs.service_name }}/latest.json" \
+            -o /tmp/published-contract.json
+          echo "Downloaded published contract ($(wc -c < /tmp/published-contract.json) bytes)"
+
+      - name: Set up Go (for oasdiff)
+        if: steps.preflight.outputs.run == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+          cache: false
+
+      - name: Install oasdiff
+        if: steps.preflight.outputs.run == 'true'
+        run: |
+          go install github.com/oasdiff/oasdiff@v1.11.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Detect breaking changes
+        if: steps.preflight.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          oasdiff breaking \
+            /tmp/published-contract.json \
+            docs/openapi.json \
+            --fail-on ERR
+          echo "No breaking changes detected — safe to deploy"
+
+  build-and-pin:
+    name: Build canonical artifact + pin dev
+    needs: contract-gate
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - name: Validate deployment source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Trunk-based, single-main: the canonical artifact is built from main.
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "::error::builds must run from main (single-branch trunk); got ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.event.repository.name }}
+
+      - name: Enforce core module release policy
+        shell: bash
+        working-directory: ${{ github.event.repository.name }}
+        # The canonical artifact is promoted to prod unchanged, so it must satisfy
+        # the strictest (prod) module-release policy at build time. Skipped for repos
+        # without the check (e.g. frontends).
+        run: |
+          set -euo pipefail
+          if [[ -x ./scripts/check_core_module_versions.sh ]]; then
+            ./scripts/check_core_module_versions.sh "${{ inputs.module_release_env }}"
+          else
+            echo "No scripts/check_core_module_versions.sh — skipping core module release policy"
+          fi
+
+      - name: Check required deploy secrets
+        shell: bash
+        env:
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          # AWS auth is GitHub OIDC (no long-lived keys). A cross-repo token is
+          # still needed for private Go module fetch in the build and to pin the
+          # digest into the infra repo.
+          if [[ -z "${CROSS_REPO_TOKEN:-${GH_PAT:-}}" ]]; then
+            echo "::error::Missing required secret: CROSS_REPO_TOKEN or GH_PAT"
+            exit 1
+          fi
+          echo "Required deploy secrets are present"
+
+      # OIDC (no long-lived keys): assume the ci-build ORCHESTRATOR identity
+      # (environments/management/ci-identity). It may only upload the source
+      # tarball and start/read the canonical build — it cannot push images,
+      # touch clusters, or assume any deploy/terraform role.
+      - name: Configure AWS credentials (OIDC — ci-build)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.ci_build_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-${{ inputs.service_name }}-build
+
+      - name: Ensure AWS CLI is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v aws >/dev/null 2>&1; then aws --version; exit 0; fi
+          python3 -m pip install --user --upgrade awscli
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/aws" --version
+
+      - name: Package + upload immutable source revision
+        id: source
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          SERVICE_DIR="${{ github.event.repository.name }}"
+          TMP_TARBALL="/tmp/${SERVICE_DIR}-${GITHUB_RUN_ID}.tgz"
+          tar -czf "${TMP_TARBALL}" \
+            --exclude="${SERVICE_DIR}/.git" \
+            --exclude="${SERVICE_DIR}/node_modules" \
+            --exclude="${SERVICE_DIR}/coverage.out" \
+            --exclude="${SERVICE_DIR}/.tmp" \
+            -C "${GITHUB_WORKSPACE}" "${SERVICE_DIR}"
+          BUCKET="inboxxhq-terraform-ci-artifacts-$(aws sts get-caller-identity --query Account --output text)"
+          if ! aws s3 ls "s3://${BUCKET}" >/dev/null 2>&1; then
+            aws s3 mb "s3://${BUCKET}" --region "${AWS_REGION}" >/dev/null
+            aws s3api put-public-access-block --bucket "${BUCKET}" --public-access-block-configuration '{"BlockPublicAcls":true,"IgnorePublicAcls":true,"BlockPublicPolicy":true,"RestrictPublicBuckets":true}' >/dev/null 2>&1 || true
+          fi
+          # Content-addressed by commit so the canonical build is idempotent.
+          SOURCE_URI="s3://${BUCKET}/canonical-build/${SERVICE_DIR}/${GITHUB_SHA}/source.tgz"
+          aws s3 cp "${TMP_TARBALL}" "${SOURCE_URI}" >/dev/null
+          echo "source_uri=${SOURCE_URI}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run canonical build (build once -> central registry -> signed digest)
+        id: build
+        shell: bash
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          BUILD_PROJECT: ${{ inputs.build_project }}
+          SERVICE_NAME: ${{ inputs.service_name }}
+          GITHUB_TOKEN: ${{ secrets.CROSS_REPO_TOKEN || secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          SERVICE_DIR="${{ github.event.repository.name }}"
+          BUILD_ID="$(aws codebuild start-build \
+            --region "${AWS_REGION}" \
+            --project-name "${BUILD_PROJECT}" \
+            --environment-variables-override \
+              "name=SERVICE_NAME,value=${SERVICE_NAME},type=PLAINTEXT" \
+              "name=SERVICE_DIR,value=${SERVICE_DIR},type=PLAINTEXT" \
+              "name=SOURCE_TARBALL_S3_URI,value=${{ steps.source.outputs.source_uri }},type=PLAINTEXT" \
+              "name=SOURCE_COMMIT,value=${GITHUB_SHA},type=PLAINTEXT" \
+              "name=GITHUB_TOKEN,value=${GITHUB_TOKEN},type=PLAINTEXT" \
+            --query 'build.id' --output text)"
+          echo "Canonical build started: ${BUILD_ID}"
+          describe() { aws codebuild batch-get-builds --region "${AWS_REGION}" --ids "${BUILD_ID}"; }
+          DEEPLINK="$(describe | jq -r '.builds[0].logs.deepLink // empty')"
+          [[ -n "${DEEPLINK}" ]] && echo "CodeBuild: ${DEEPLINK}" || true
+          BUILD_JSON=""
+          while :; do
+            BUILD_JSON="$(describe)"
+            STATUS="$(printf '%s' "${BUILD_JSON}" | jq -r '.builds[0].buildStatus // empty')"
+            case "${STATUS}" in
+              SUCCEEDED) echo "Canonical build SUCCEEDED"; break ;;
+              FAILED|FAULT|STOPPED|TIMED_OUT) echo "::error::canonical build ${STATUS}"; exit 1 ;;
+              *) sleep 15 ;;
+            esac
+          done
+          IMAGE_REF="$(printf '%s' "${BUILD_JSON}" | jq -r '.builds[0].exportedEnvironmentVariables[]? | select(.name=="IMAGE_REF") | .value')"
+          IMAGE_DIGEST="$(printf '%s' "${BUILD_JSON}" | jq -r '.builds[0].exportedEnvironmentVariables[]? | select(.name=="IMAGE_DIGEST") | .value')"
+          if [[ -z "${IMAGE_REF}" || -z "${IMAGE_DIGEST}" ]]; then
+            echo "::error::canonical build did not export IMAGE_REF/IMAGE_DIGEST"
+            exit 1
+          fi
+          echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+          echo "image_digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Canonical artifact: ${IMAGE_REF}"
+
+      - name: Pin digest into dev overlay (first consumer)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN || secrets.GH_PAT }}
+          SERVICE_NAME: ${{ inputs.service_name }}
+          INFRA_REPO: ${{ inputs.infra_repo }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${INFRA_REPO}.git" /tmp/platform-infra
+          cd /tmp/platform-infra
+          git config user.email "ci-bot@inboxxhq.com"
+          git config user.name "inboxxhq-ci"
+          # Many services can pin concurrently; only this service's own overlay
+          # file changes, so retry against the freshest main with jittered backoff.
+          pushed=""
+          deadline=$(( $(date +%s) + 600 ))
+          attempt=0
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            attempt=$((attempt + 1))
+            git fetch --quiet origin main
+            git reset --hard --quiet origin/main
+            bash scripts/gitops-set-image.sh "${SERVICE_NAME}" dev "${{ steps.build.outputs.image_ref }}"
+            bash scripts/write-release-metadata.sh "${SERVICE_NAME}" dev "${{ steps.build.outputs.image_ref }}" "${GITHUB_SHA}"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "dev already pinned to ${{ steps.build.outputs.image_digest }}; nothing to commit"
+              pushed="noop"; break
+            fi
+            git commit -q -m "deploy(${SERVICE_NAME}/dev): ${{ steps.build.outputs.image_digest }}"
+            if git push --quiet origin HEAD:main 2>/dev/null; then
+              echo "Pinned ${SERVICE_NAME}/dev -> ${{ steps.build.outputs.image_ref }} (attempt ${attempt})"
+              pushed="yes"; break
+            fi
+            echo "push race lost (attempt ${attempt}); rebasing on latest main"
+            sleep $(( (RANDOM % 6) + 2 ))
+          done
+          test -n "${pushed}" || { echo "::error::failed to pin dev overlay within deadline"; exit 1; }
+          echo "Argo CD reconciles dev; on Synced+Healthy it triggers promotion of this exact digest to staging."
