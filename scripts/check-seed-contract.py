@@ -6,27 +6,40 @@ Language-agnostic enforcement of the enterprise seeding standard
 service violates the contract. Stateless services (no cmd/seed and no seed data
 tree) are skipped with exit 0 so this can run fleet-wide.
 
+Governance model (federated ownership, central governance — ADR-0059):
+  The service OWNS its seed layout, code, data, and tests. The platform gate
+  enforces OUTCOMES/INVARIANTS, not a specific file layout. So this checker fails
+  only on things that are unsafe or non-deployable, and merely *nudges* toward the
+  recommended canonical tree.
+
 Service classes (auto-detected):
   * stateless          — no cmd/seed and no seed tree            -> skip (exit 0)
-  * file-based seeder   — ships a <...>/seed/data tree           -> FULL contract
+  * file-based seeder   — ships a <...>/seed/data tree           -> invariants
   * delegated seeder    — cmd/seed pulls data from an external
                           *-core-postgres/seed module (SSOT in
                           that repo; enforced there)             -> marker only
   * code-only seeder    — cmd/seed seeds programmatically
                           (SQL/generated), ships no JSON tree     -> marker only
 
-Full contract (file-based seeders):
+Enforced invariants (file-based seeders — HARD failures):
   1. Dockerfile carries the marker  # seed binary path: /app/<binary>
+     (the seed binary must be built + shipped for the Argo PreSync hook)
   2. Dockerfile copies the seed data tree into the runtime image
-  3. The seed data tree exists with canonical subdirs:
-        system/ dev/ staging/ preprod/ prod/
-  4. Files under staging/ preprod/ prod/ are placeholders:
-        a JSON array whose every object has only the key "comment"
-  5. deploy-reusable.yml (if present) has no  SEED_COMMAND=""  override
+  3. NO REAL DATA in qualified environments — every seed file that targets
+     staging / preprod / prod is a placeholder (a JSON array whose every object
+     has only the key "comment"). This is checked for BOTH layouts:
+        canonical:  <data>/staging|preprod|prod/*.json
+        flat:       <data>/*.staging.json  *.preprod.json  *.prod.json
+  4. deploy-reusable.yml (if present) has no  SEED_COMMAND=""  override
+
+Recommended (SOFT — informational ::notice::, never fails):
+  * canonical subdir layout  system/ dev/ staging/ preprod/ prod/
+    Services on the flat *.common.json (SSOT) + *.local.json (fixtures) layout
+    are compliant; convergence to canonical is encouraged, not mandated.
 
 Marker-only contract (delegated / code-only seeders): the seed binary must be
-built and shipped, so the Dockerfile marker (check 1) is still required — the
-file-tree checks (2-4) do not apply because the data SSOT is not in this repo.
+built and shipped, so the Dockerfile marker (invariant 1) is still required —
+the file/data checks do not apply because the data SSOT is not in this repo.
 
 This is the single-repo enforcement twin of the seeding standard's §6b.
 
@@ -42,8 +55,8 @@ import re
 import sys
 from pathlib import Path
 
-REQUIRED_SUBDIRS = ("system", "dev", "staging", "preprod", "prod")
-PLACEHOLDER_DIRS = ("staging", "preprod", "prod")
+CANONICAL_SUBDIRS = ("system", "dev", "staging", "preprod", "prod")
+QUALIFIED_ENVS = ("staging", "preprod", "prod")
 SEED_MARKER = re.compile(r"#\s*seed binary path:\s*/app/\S+")
 
 
@@ -115,43 +128,51 @@ def check_dockerfile(root: Path, data_dir: Path | None, errors: list[str]) -> No
             )
 
 
-def check_tree(data_dir: Path | None, errors: list[str]) -> None:
-    if data_dir is None:
-        errors.append(
-            "seed data tree: no '<...>/seed/data' directory found under internal/"
-        )
-        return
-    for sub in REQUIRED_SUBDIRS:
-        if not (data_dir / sub).is_dir():
-            errors.append(f"seed data tree: missing required subdir '{sub}/'")
+def is_canonical_layout(data_dir: Path) -> bool:
+    """True if the service uses the recommended system/dev/staging/preprod/prod tree."""
+    return all((data_dir / sub).is_dir() for sub in CANONICAL_SUBDIRS)
+
+
+def qualified_env_files(data_dir: Path) -> list[Path]:
+    """Every seed JSON that targets a qualified env, in BOTH layouts.
+
+    canonical:  <data>/staging|preprod|prod/*.json
+    flat:       <data>/*.staging.json  *.preprod.json  *.prod.json
+    """
+    files: list[Path] = []
+    for env in QUALIFIED_ENVS:
+        d = data_dir / env
+        if d.is_dir():
+            files.extend(sorted(d.glob("*.json")))
+        files.extend(sorted(data_dir.glob(f"*.{env}.json")))
+    return files
 
 
 def check_placeholders(data_dir: Path | None, errors: list[str]) -> None:
+    """INVARIANT: no real data may target staging/preprod/prod (both layouts)."""
     if data_dir is None:
         return
-    for sub in PLACEHOLDER_DIRS:
-        d = data_dir / sub
-        if not d.is_dir():
+    for jf in qualified_env_files(data_dir):
+        try:
+            arr = json.loads(jf.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"{jf.relative_to(data_dir)}: invalid JSON (expected placeholder array): {exc}")
             continue
-        for jf in sorted(d.glob("*.json")):
-            try:
-                arr = json.loads(jf.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                errors.append(f"{jf}: invalid JSON (expected placeholder array): {exc}")
+        if not isinstance(arr, list):
+            errors.append(f"{jf.relative_to(data_dir)}: placeholder must be a JSON array")
+            continue
+        for i, obj in enumerate(arr):
+            if not isinstance(obj, dict):
+                errors.append(f"{jf.relative_to(data_dir)}[{i}]: placeholder entries must be objects")
                 continue
-            if not isinstance(arr, list):
-                errors.append(f"{jf}: placeholder must be a JSON array")
-                continue
-            for i, obj in enumerate(arr):
-                if not isinstance(obj, dict):
-                    errors.append(f"{jf}[{i}]: placeholder entries must be objects")
-                    continue
-                extra = [k for k in obj if k != "comment"]
-                if extra:
-                    errors.append(
-                        f"{jf}[{i}]: non-placeholder field(s) {extra} found; "
-                        f"{sub}/ must contain only 'comment' (move data to system/)"
-                    )
+            extra = [k for k in obj if k != "comment"]
+            if extra:
+                errors.append(
+                    f"{jf.relative_to(data_dir)}[{i}]: real data field(s) {extra} in a "
+                    "qualified-env seed file; staging/preprod/prod must be placeholder-only "
+                    "(objects with just 'comment'). Move reference data to system/ or "
+                    "*.common.json (loaded in every env)."
+                )
 
 
 def check_no_seed_command_override(root: Path, errors: list[str]) -> None:
@@ -204,9 +225,10 @@ def main() -> int:
         print(f"seed-contract: OK ({kind}; enforced seed-binary marker only).")
         return 0
 
-    # File-based seeder: enforce the full contract.
+    # File-based seeder: enforce invariants (marker + data copy + no real data in
+    # qualified envs + no SEED_COMMAND override). Layout is the service's own
+    # choice — canonical is recommended (soft notice), not required.
     check_dockerfile(root, data_dir, errors)
-    check_tree(data_dir, errors)
     check_placeholders(data_dir, errors)
     check_no_seed_command_override(root, errors)
 
@@ -219,7 +241,15 @@ def main() -> int:
         return 1
 
     rel = data_dir.relative_to(root)
-    print(f"seed-contract: OK (file-based; data tree at {rel}).")
+    if is_canonical_layout(data_dir):
+        print(f"seed-contract: OK (file-based, canonical layout; data tree at {rel}).")
+    else:
+        missing = [s for s in CANONICAL_SUBDIRS if not (data_dir / s).is_dir()]
+        print(
+            f"::notice::seed-contract: {rel} uses a flat/service-owned layout; "
+            f"canonical subdirs {missing} are recommended (not required)."
+        )
+        print(f"seed-contract: OK (file-based, flat/service-owned layout; data tree at {rel}).")
     return 0
 
 
