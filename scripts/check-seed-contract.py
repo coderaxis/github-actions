@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Seed-contract guard (CI). Run from a service repo root.
+
+Language-agnostic enforcement of the enterprise seeding standard
+(docs/core-docs/standards/seeding/README.md). Fails (exit 1) when a stateful
+service violates the contract. Stateless services (no cmd/seed and no seed data
+tree) are skipped with exit 0 so this can run fleet-wide.
+
+Checks (each an independent failure):
+  1. Dockerfile carries the marker  # seed binary path: /app/<binary>
+  2. Dockerfile copies the seed data tree into the runtime image
+  3. The seed data tree exists with canonical subdirs:
+        system/ dev/ staging/ preprod/ prod/
+  4. Files under staging/ preprod/ prod/ are placeholders:
+        a JSON array whose every object has only the key "comment"
+  5. deploy-reusable.yml (if present) has no  SEED_COMMAND=""  override
+
+This is the single-repo enforcement twin of the seeding standard's §6b.
+
+SSOT: this file lives in coderaxis/github-actions and is invoked by the central
+reusable workflow .github/workflows/seed-contract-check.yml. Service repos carry
+only a thin caller; they do NOT vendor this script.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+REQUIRED_SUBDIRS = ("system", "dev", "staging", "preprod", "prod")
+PLACEHOLDER_DIRS = ("staging", "preprod", "prod")
+SEED_MARKER = re.compile(r"#\s*seed binary path:\s*/app/\S+")
+
+
+def find_seed_data_dir(root: Path) -> Path | None:
+    """Locate the canonical <...>/seed/data directory under internal/."""
+    internal = root / "internal"
+    search_root = internal if internal.is_dir() else root
+    for dirpath, dirnames, _ in os.walk(search_root):
+        p = Path(dirpath)
+        if p.name == "data" and p.parent.name == "seed":
+            return p
+        # prune vcs/vendor noise
+        dirnames[:] = [d for d in dirnames if d not in {".git", "vendor", "node_modules"}]
+    return None
+
+
+def is_stateful(root: Path, data_dir: Path | None) -> bool:
+    return (root / "cmd" / "seed").is_dir() or data_dir is not None
+
+
+def check_dockerfile(root: Path, data_dir: Path | None, errors: list[str]) -> None:
+    dockerfile = root / "Dockerfile"
+    if not dockerfile.is_file():
+        errors.append("Dockerfile: missing (a stateful service must ship one)")
+        return
+    text = dockerfile.read_text(encoding="utf-8", errors="replace")
+    if not SEED_MARKER.search(text):
+        errors.append(
+            "Dockerfile: missing marker '# seed binary path: /app/<binary>'"
+        )
+    if data_dir is not None:
+        # The Dockerfile must COPY the seed data tree. Accept any COPY line that
+        # references the seed data path segment.
+        if "seed/data" not in text and "seed\\data" not in text:
+            errors.append(
+                "Dockerfile: does not copy the seed data tree "
+                "(no reference to 'seed/data')"
+            )
+
+
+def check_tree(data_dir: Path | None, errors: list[str]) -> None:
+    if data_dir is None:
+        errors.append(
+            "seed data tree: no '<...>/seed/data' directory found under internal/"
+        )
+        return
+    for sub in REQUIRED_SUBDIRS:
+        if not (data_dir / sub).is_dir():
+            errors.append(f"seed data tree: missing required subdir '{sub}/'")
+
+
+def check_placeholders(data_dir: Path | None, errors: list[str]) -> None:
+    if data_dir is None:
+        return
+    for sub in PLACEHOLDER_DIRS:
+        d = data_dir / sub
+        if not d.is_dir():
+            continue
+        for jf in sorted(d.glob("*.json")):
+            try:
+                arr = json.loads(jf.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                errors.append(f"{jf}: invalid JSON (expected placeholder array): {exc}")
+                continue
+            if not isinstance(arr, list):
+                errors.append(f"{jf}: placeholder must be a JSON array")
+                continue
+            for i, obj in enumerate(arr):
+                if not isinstance(obj, dict):
+                    errors.append(f"{jf}[{i}]: placeholder entries must be objects")
+                    continue
+                extra = [k for k in obj if k != "comment"]
+                if extra:
+                    errors.append(
+                        f"{jf}[{i}]: non-placeholder field(s) {extra} found; "
+                        f"{sub}/ must contain only 'comment' (move data to system/)"
+                    )
+
+
+def check_no_seed_command_override(root: Path, errors: list[str]) -> None:
+    wf = root / ".github" / "workflows" / "deploy-reusable.yml"
+    if not wf.is_file():
+        return
+    text = wf.read_text(encoding="utf-8", errors="replace")
+    empty_assign = re.search(r'SEED_COMMAND\s*=\s*(""|\'\')', text)
+    if not empty_assign:
+        return
+    # An empty assignment is the legitimate else-branch fallback ONLY when the
+    # workflow actually computes SEED_BINARY. A hardcoded empty with no binary
+    # logic is a real "seeding disabled" override and is not permitted.
+    if "SEED_BINARY" in text:
+        return
+    errors.append(
+        ".github/workflows/deploy-reusable.yml: hardcodes SEED_COMMAND=\"\" "
+        "with no SEED_BINARY logic (seeding disabled); this is not permitted"
+    )
+
+
+def main() -> int:
+    root = Path(os.getcwd())
+    data_dir = find_seed_data_dir(root)
+
+    if not is_stateful(root, data_dir):
+        print("seed-contract: stateless service (no cmd/seed, no seed tree); skipping.")
+        return 0
+
+    errors: list[str] = []
+    check_dockerfile(root, data_dir, errors)
+    check_tree(data_dir, errors)
+    check_placeholders(data_dir, errors)
+    check_no_seed_command_override(root, errors)
+
+    if errors:
+        print("::group::seed-contract violations")
+        for e in errors:
+            print(f"::error::{e}")
+        print("::endgroup::")
+        print(f"seed-contract: FAILED with {len(errors)} violation(s).")
+        return 1
+
+    rel = data_dir.relative_to(root) if data_dir else "(none)"
+    print(f"seed-contract: OK (data tree at {rel}).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

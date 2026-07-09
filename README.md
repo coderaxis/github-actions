@@ -32,6 +32,7 @@ live under `.github/workflows/` and are consumed via `uses:` at the **job** leve
 | Workflow | Purpose |
 | -------- | ------- |
 | [`deploy-reusable.yml`](.github/workflows/deploy-reusable.yml) | InboxxHQ GitOps delivery — CI orchestrates the central canonical build (`inboxxhq-build`), reads back the signed image **digest**, and pins it into the `dev` overlay (first consumer). staging/preprod/prod promote the same digest via the Promotion Controller. **Build once, deploy the digest.** |
+| [`seed-contract-check.yml`](.github/workflows/seed-contract-check.yml) | Language-agnostic seeding-contract gate (seeding standard §6b) — Dockerfile seed-binary marker + `seed/data` copy, canonical `system/dev/staging/preprod/prod` tree, placeholder-only qualified envs, no `SEED_COMMAND=""` override. Runs the pinned [`scripts/check-seed-contract.py`](scripts/check-seed-contract.py) (SSOT) against the caller; stateless services self-skip. |
 
 Each service repo carries only a thin caller:
 
@@ -49,6 +50,21 @@ jobs:
     with:
       service_name: auth-service
     secrets: inherit
+```
+
+Stateful service repos also carry a thin seed-contract caller:
+
+```yaml
+# .github/workflows/seed-contract-check.yml
+on:
+  push: { branches: ["**"] }
+  pull_request:
+    paths: ["Dockerfile", "cmd/seed/**", "internal/**/seed/**", ".github/workflows/seed-contract-check.yml"]
+permissions:
+  contents: read
+jobs:
+  seed-contract:
+    uses: coderaxis/github-actions/.github/workflows/seed-contract-check.yml@v1
 ```
 
 Delivery logic changes are made **once** here and rolled out by moving the `@v1` tag —
