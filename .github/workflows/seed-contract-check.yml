@@ -1,0 +1,55 @@
+name: Reusable Seed-Contract Check
+
+# Central, single-source seeding-contract gate for the coderaxis platform.
+# Language-agnostic: enforces docs/core-docs/standards/seeding/README.md §6b
+# WITHOUT running any service code. Consumed by every stateful service repo via a
+# thin caller:
+#
+#   jobs:
+#     seed-contract:
+#       uses: coderaxis/github-actions/.github/workflows/seed-contract-check.yml@v1
+#
+# What it enforces (see scripts/check-seed-contract.py):
+#   1. Dockerfile marker  # seed binary path: /app/<binary>
+#   2. Dockerfile copies the seed/data tree into the runtime image
+#   3. Canonical data-tree subdirs  system/ dev/ staging/ preprod/ prod/
+#   4. staging/preprod/prod are placeholder-only (objects with just "comment")
+#   5. no SEED_COMMAND="" override in a (legacy) deploy-reusable.yml
+# Stateless services (no cmd/seed, no seed tree) self-skip with success.
+#
+# The checker script lives ONCE here (SSOT). Service repos vendor nothing — the
+# reusable checks out this repo alongside the caller and runs the pinned checker.
+#
+# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2.
+
+on:
+  workflow_call:
+    inputs:
+      actions_ref:
+        description: "Ref of coderaxis/github-actions providing the checker (defaults to the moving major tag)."
+        required: false
+        type: string
+        default: v1
+
+permissions:
+  contents: read
+
+jobs:
+  seed-contract:
+    name: Seed contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout service (caller)
+        uses: actions/checkout@v4
+
+      - name: Checkout central checker
+        uses: actions/checkout@v4
+        with:
+          repository: coderaxis/github-actions
+          ref: ${{ inputs.actions_ref }}
+          path: .coderaxis-ci
+
+      - name: Run seed-contract guard
+        shell: bash
+        run: python3 .coderaxis-ci/scripts/check-seed-contract.py
