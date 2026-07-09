@@ -65,6 +65,19 @@ on:
         required: false
         type: string
         default: '["self-hosted", "linux", "x64", "inboxxhq-deploy"]'
+    secrets:
+      # Cross-org callers MUST pass this explicitly. `secrets: inherit` only works
+      # within the same org/enterprise; service repos live in a different org than
+      # this central workflow, so inherit silently forwards zero secrets. AWS auth is
+      # pure GitHub OIDC (no static keys) — this is the only secret delivery needs:
+      # private Go module fetch in the canonical build + pinning the digest into the
+      # infra GitOps repo.
+      CROSS_REPO_TOKEN:
+        description: "Cross-repo token (PAT or GitHub App token) for private module fetch and GitOps digest pinning."
+        required: false
+      GH_PAT:
+        description: "Optional fallback for CROSS_REPO_TOKEN."
+        required: false
 
 permissions:
   contents: read
