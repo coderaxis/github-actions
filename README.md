@@ -1,6 +1,7 @@
 # coderaxis/github-actions
 
-Shared **reusable composite actions** for the coderaxis platform CI/CD.
+Shared **reusable composite actions** and **reusable workflows** for the coderaxis
+platform CI/CD.
 
 Reference an action by its subfolder and a major-version tag:
 
@@ -22,6 +23,36 @@ credentials as inputs at call time.
 | [`module-auth`](module-auth/action.yml) | Mint a short-lived GitHub App installation token (`coderaxis-module-reader`) and configure git for private module reads. Replaces long-lived `CROSS_REPO_TOKEN` / `WORKFLOW_GH_PAT`. |
 
 Future actions (e.g. `docker-login`, `slack-notify`, `aws-login`) live as sibling folders.
+
+## Reusable workflows
+
+Whole workflows (job-level OIDC, `permissions`, `concurrency`, multi-job orchestration)
+live under `.github/workflows/` and are consumed via `uses:` at the **job** level.
+
+| Workflow | Purpose |
+| -------- | ------- |
+| [`deploy-reusable.yml`](.github/workflows/deploy-reusable.yml) | InboxxHQ GitOps delivery — CI orchestrates the central canonical build (`inboxxhq-build`), reads back the signed image **digest**, and pins it into the `dev` overlay (first consumer). staging/preprod/prod promote the same digest via the Promotion Controller. **Build once, deploy the digest.** |
+
+Each service repo carries only a thin caller:
+
+```yaml
+# .github/workflows/deploy.yml
+on:
+  push: { branches: [main] }
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    uses: coderaxis/github-actions/.github/workflows/deploy-reusable.yml@v1
+    with:
+      service_name: auth-service
+    secrets: inherit
+```
+
+Delivery logic changes are made **once** here and rolled out by moving the `@v1` tag —
+never by editing ~40 service repos.
 
 ## Versioning
 
