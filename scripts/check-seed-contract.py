@@ -25,9 +25,14 @@ Enforced invariants (file-based seeders — HARD failures):
   1. Dockerfile carries the marker  # seed binary path: /app/<binary>
      (the seed binary must be built + shipped for the Argo PreSync hook)
   2. Dockerfile copies the seed data tree into the runtime image
-  3. NO REAL DATA in qualified environments — every seed file that targets
-     staging / preprod / prod is a placeholder (a JSON array whose every object
-     has only the key "comment"). This is checked for BOTH layouts:
+  3. NO LITERAL ENV-SPECIFIC DATA OR SECRETS in qualified environments — every
+     seed file that targets staging / preprod / prod is either:
+        placeholder    — objects with only "comment", OR
+        env-indirected — reference bindings whose env-specific values are injected
+                         via env vars (fields ending in "Env"/"Ref") plus non-
+                         identifying labels (the ADR-0046 pattern).
+     Literal IDs/emails/domains, secret-bearing fields, and nested fixture objects
+     fail. Checked for BOTH layouts:
         canonical:  <data>/staging|preprod|prod/*.json
         flat:       <data>/*.staging.json  *.preprod.json  *.prod.json
   4. deploy-reusable.yml (if present) has no  SEED_COMMAND=""  override
@@ -58,6 +63,27 @@ from pathlib import Path
 CANONICAL_SUBDIRS = ("system", "dev", "staging", "preprod", "prod")
 QUALIFIED_ENVS = ("staging", "preprod", "prod")
 SEED_MARKER = re.compile(r"#\s*seed binary path:\s*/app/\S+")
+
+# Qualified-env seed files (staging/preprod/prod) must not carry literal
+# environment-specific values or secrets. Two compliant shapes are allowed:
+#   * placeholder    — objects with only "comment"
+#   * env-indirected — reference bindings whose environment-specific values are
+#                      INJECTED via env vars (fields ending in "Env"/"Ref"), plus
+#                      non-identifying structural labels. This is the ADR-0046
+#                      pattern: SSOT shape in git, env-driven values at deploy.
+# Anything else (literal IDs/emails/domains, secrets, nested fixture objects) is a
+# real-data leak into a prod-like environment and fails.
+SAFE_QUALIFIED_LABELS = {
+    "comment", "name", "description", "role", "roleslug", "slug", "key",
+    "allowmissing", "optional", "enabled", "order", "priority", "type", "kind",
+}
+SECRET_FIELD_RE = re.compile(
+    r"(?i)(password|passwd|pwd|secret|token|apikey|api_key|access_key|"
+    r"privatekey|private_key|credential|salt|signingkey)"
+)
+LITERAL_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def find_seed_data_dir(root: Path) -> Path | None:
@@ -148,31 +174,55 @@ def qualified_env_files(data_dir: Path) -> list[Path]:
     return files
 
 
+def _qualified_field_violation(key: str, value: object) -> str | None:
+    """Return a violation message if a field is illegal in a qualified-env file.
+
+    Legal: "comment", env-indirection fields (name ends in Env/Ref), and
+    non-identifying structural labels. Illegal: secret-bearing fields, nested
+    fixture objects, and literal environment-specific values.
+    """
+    indirection = key.endswith("Env") or key.endswith("Ref")
+    if SECRET_FIELD_RE.search(key) and not indirection:
+        return (f"secret-bearing field '{key}' — never commit secrets; inject via "
+                "'<field>Env' + a secrets manager")
+    if isinstance(value, (dict, list)):
+        return (f"nested value under '{key}' — qualified-env data must be flat, "
+                "env-indirected reference (no committed fixture objects)")
+    if indirection:
+        if isinstance(value, str) and ("@" in value or LITERAL_UUID_RE.match(value.strip())):
+            return f"indirection field '{key}' holds a literal value; it must name an env var"
+        return None
+    if key.lower() in SAFE_QUALIFIED_LABELS:
+        return None
+    return (f"field '{key}' carries literal data in a qualified-env file; "
+            "environment-specific values must be injected via an '<field>Env' env-var "
+            "reference (ADR-0046), with reference shape kept in system/ or *.common.json")
+
+
 def check_placeholders(data_dir: Path | None, errors: list[str]) -> None:
-    """INVARIANT: no real data may target staging/preprod/prod (both layouts)."""
+    """INVARIANT: no literal env-specific data or secrets may target staging/
+    preprod/prod. Placeholder-only OR env-indirected reference is allowed
+    (both canonical and flat layouts)."""
     if data_dir is None:
         return
     for jf in qualified_env_files(data_dir):
+        rel = jf.relative_to(data_dir)
         try:
             arr = json.loads(jf.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            errors.append(f"{jf.relative_to(data_dir)}: invalid JSON (expected placeholder array): {exc}")
+            errors.append(f"{rel}: invalid JSON (expected a JSON array): {exc}")
             continue
         if not isinstance(arr, list):
-            errors.append(f"{jf.relative_to(data_dir)}: placeholder must be a JSON array")
+            errors.append(f"{rel}: qualified-env seed file must be a JSON array")
             continue
         for i, obj in enumerate(arr):
             if not isinstance(obj, dict):
-                errors.append(f"{jf.relative_to(data_dir)}[{i}]: placeholder entries must be objects")
+                errors.append(f"{rel}[{i}]: entries must be objects")
                 continue
-            extra = [k for k in obj if k != "comment"]
-            if extra:
-                errors.append(
-                    f"{jf.relative_to(data_dir)}[{i}]: real data field(s) {extra} in a "
-                    "qualified-env seed file; staging/preprod/prod must be placeholder-only "
-                    "(objects with just 'comment'). Move reference data to system/ or "
-                    "*.common.json (loaded in every env)."
-                )
+            for key, value in obj.items():
+                msg = _qualified_field_violation(key, value)
+                if msg:
+                    errors.append(f"{rel}[{i}]: {msg}")
 
 
 def check_no_seed_command_override(root: Path, errors: list[str]) -> None:
