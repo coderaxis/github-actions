@@ -225,6 +225,86 @@ def check_placeholders(data_dir: Path | None, errors: list[str]) -> None:
                     errors.append(f"{rel}[{i}]: {msg}")
 
 
+# Natural-key fields used to detect duplicate reference rows. Seeding Standard §4
+# requires every seed step to upsert by a deterministic natural key; duplicate keys in
+# the committed SSOT make that upsert non-idempotent. Checked case-insensitively.
+NATURAL_KEY_FIELDS = ("code", "slug", "key", "name", "id")
+
+
+def ssot_seed_files(data_dir: Path) -> list[Path]:
+    """Every SSOT reference-data file (the classes loaded in EVERY environment), in both
+    layouts (Seeding Standard §2):
+        canonical:  <data>/system/*.json
+        flat:       <data>/*.common.json  and  <data>/*.system.json
+    dev/demo/fixture/qualified-env files are intentionally excluded - they are not the
+    single-source-of-truth reference/bootstrap classes this control governs.
+    """
+    files: list[Path] = []
+    sysdir = data_dir / "system"
+    if sysdir.is_dir():
+        files.extend(sorted(sysdir.glob("*.json")))
+    files.extend(sorted(data_dir.glob("*.common.json")))
+    files.extend(sorted(data_dir.glob("*.system.json")))
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            ordered.append(f)
+    return ordered
+
+
+def _natural_key(obj: dict) -> tuple[str, str] | None:
+    for field in NATURAL_KEY_FIELDS:
+        for k, v in obj.items():
+            if k.lower() == field and isinstance(v, (str, int)):
+                return (field, str(v).strip().lower())
+    return None
+
+
+def check_reference_data_integrity(data_dir: Path | None, notices: list[str]) -> None:
+    """OBSERVE-mode reference-data integrity for the SSOT seed classes
+    (Seeding Standard §4/§10; seed-reference-data-integrity-control).
+
+    Reference/bootstrap data that is loaded in every environment must be internally
+    consistent: valid JSON, arrays of objects, and free of duplicate natural keys (the
+    upsert key). Duplicate natural keys make seeding non-idempotent and reference data
+    inconsistent. Findings are emitted as ::warning:: (the observe stage of
+    observe -> warn -> enforce) and do NOT fail the build; this is the reusable, fleet-wide
+    integrity mechanism registered for the reference-data-integrity control, not a new
+    parallel checker.
+    """
+    if data_dir is None:
+        return
+    for jf in ssot_seed_files(data_dir):
+        rel = jf.relative_to(data_dir)
+        try:
+            arr = json.loads(jf.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            notices.append(f"{rel}: SSOT reference data is not valid JSON: {exc}")
+            continue
+        # Some SSOT files legitimately hold a keyed object/map rather than a row array;
+        # only array-of-rows files carry natural-key rows to de-duplicate.
+        if not isinstance(arr, list):
+            continue
+        seen: dict[tuple[str, str], int] = {}
+        for i, obj in enumerate(arr):
+            if not isinstance(obj, dict):
+                notices.append(f"{rel}[{i}]: reference-data entries must be objects")
+                continue
+            nk = _natural_key(obj)
+            if nk is None:
+                continue
+            if nk in seen:
+                notices.append(
+                    f"{rel}[{i}]: duplicate natural key {nk[0]}={nk[1]!r} "
+                    f"(first seen at index {seen[nk]}); reference data must be de-duplicated "
+                    "so upsert-by-natural-key stays idempotent"
+                )
+            else:
+                seen[nk] = i
+
+
 def check_no_seed_command_override(root: Path, errors: list[str]) -> None:
     wf = root / ".github" / "workflows" / "deploy-reusable.yml"
     if not wf.is_file():
@@ -289,6 +369,18 @@ def main() -> int:
         print("::endgroup::")
         print(f"seed-contract: FAILED with {len(errors)} violation(s).")
         return 1
+
+    # Reference-data integrity (seed-reference-data-integrity-control): OBSERVE stage -
+    # surfaced as warnings, never fails the build yet (observe -> warn -> enforce).
+    notices: list[str] = []
+    check_reference_data_integrity(data_dir, notices)
+    if notices:
+        print("::group::seed reference-data integrity (observe)")
+        for n in notices:
+            print(f"::warning::{n}")
+        print("::endgroup::")
+        print(f"seed-contract: reference-data integrity reported {len(notices)} observation(s) "
+              "(observe stage; not failing).")
 
     rel = data_dir.relative_to(root)
     if is_canonical_layout(data_dir):
