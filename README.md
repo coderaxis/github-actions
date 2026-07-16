@@ -87,35 +87,53 @@ guard **enforces** it:
 This closes the gap where the model existed only as header comments that could drift
 from the implementation. The checker is the **executable form of ADR-0051**.
 
-### Control catalog (declarative + severity-aware)
+### Control catalog (policy-as-code)
 
-The controls — their id, human-readable policy, and severity — are declared in
-[`controls/delivery-model.yaml`](controls/delivery-model.yaml). The checker binds each
-control to a detector and evaluates it. **critical/major** controls fail CI; **minor**
-controls are advisory (warnings). Tune the gate with `--fail-on {critical,major,minor}`.
+The controls are declared in
+[`controls/delivery-model.yaml`](controls/delivery-model.yaml) — the catalog defines
+**policy only** (never how detection is implemented). Each control carries a stable id,
+`policy`, `rationale`, `remediation`, `severity`, `scope`, `owner`, and lifecycle
+`status`; the checker binds each `detector` to an implementation that may evolve
+(regex → AST → CodeQL) without touching the catalog. **critical/major** controls fail
+CI; **minor** controls are advisory. Tune with `--fail-on {critical,major,minor}`.
 
-| Control | Policy | Severity |
-| ------- | ------ | -------- |
-| DM-001 | CI never builds or publishes a container artifact | critical |
-| DM-002 | Exactly one canonical build; **no per-environment or per-variant builds** | critical |
-| DM-003 | Only the `dev` overlay is written; qualified envs are promoted, never pinned here | critical |
-| DM-004 | CI assumes only the ci-build orchestrator identity (no `*deploy*`/`*terraform-apply*` role) | critical |
-| DM-005 | **No docs/build-variant tag injected into the canonical build** (no `GO_BUILD_TAGS=swagger`, `-tags swagger`) | critical |
-| DM-006 | Least-privilege permissions (⊆ `contents: read` + `id-token: write`) | major |
-| DM-007 | The canonical artifact is built from `main` (trunk-based) | major |
-| DM-008 | OIDC credentials are configured (no long-lived keys) | major |
-| DM-009 | The immutable digest is pinned into GitOps (behaviour, not a specific script name) | major |
-| DM-010 | `contract_version` output is declared (versioned public API) | major |
-| DM-011 | `image_digest` output is declared | minor |
-| DM-012 | The workflow cites its governing policy SSOT (`ADR-0051`, `RFC-0020`) | minor |
+Control IDs (`DM-NNN`) are **stable and permanent** — never rename or recycle; retire a
+control via `status: deprecated|superseded`. The table below is **generated** from the
+catalog (drift-gated in CI via `--verify-docs`), so docs and policy never diverge:
+
+<!-- BEGIN delivery-controls (generated: scripts/check-delivery-model.py --write-docs) -->
+
+_Generated from `controls/delivery-model.yaml` by `scripts/check-delivery-model.py --write-docs` — do not edit by hand._
+
+| Control | Policy | Severity | Scope | Owner | Status |
+| ------- | ------ | -------- | ----- | ----- | ------ |
+| DM-001 | CI orchestrates the central canonical build and must never build or publish a container image itself. The central build executor is the sole publish identity. | critical | reusable-workflow | platform-infrastructure | active |
+| DM-002 | A single immutable artifact is built once and promoted unchanged. There must be no second build for another environment or build variant. | critical | reusable-workflow | architecture-review-board | active |
+| DM-003 | Dev is the first consumer. staging / preprod / prod receive the same digest via the Promotion Controller and must never be pinned, built, or written by this workflow. | critical | reusable-workflow | platform-infrastructure | active |
+| DM-004 | AWS auth uses OIDC to assume the ci-build orchestrator role (inputs.ci_build_role_arn). Superseded per-env deploy / terraform-apply role ARNs must never be referenced. | critical | reusable-workflow | security | active |
+| DM-005 | The workflow must not pass swagger/docs build-variant flags (e.g. GO_BUILD_TAGS=swagger, -tags swagger) to the canonical build. The same swagger-less artifact is promoted to every environment. | critical | reusable-workflow | architecture-review-board | active |
+| DM-006 | Workflow and job permissions are a subset of {contents: read, id-token: write}. No write scope beyond id-token (no packages: write, no contents: write). | major | reusable-workflow | security | active |
+| DM-007 | A run step must fail the build when the ref is not main. | major | reusable-workflow | platform-infrastructure | active |
+| DM-008 | An OIDC configure-aws-credentials step must be present and id-token: write must be granted, so credentials are short-lived and keyless. | major | reusable-workflow | security | active |
+| DM-009 | The workflow must pin the built image (by digest/ref) into the GitOps infra repo dev overlay. This asserts the pin behaviour exists; it does not mandate a specific helper-script name. | major | reusable-workflow | platform-infrastructure | active |
+| DM-010 | The reusable workflow exposes a contract_version workflow_call output (versioned public API). | major | reusable-workflow | platform-infrastructure | active |
+| DM-011 | The reusable workflow exposes the promoted image_digest as a workflow_call output. | minor | reusable-workflow | platform-infrastructure | active |
+| DM-012 | The header references ADR-0051 and RFC-0020 so implementation and policy SSOT cannot drift apart. | minor | reusable-workflow | architecture-review-board | active |
+
+<!-- END delivery-controls -->
 
 Controls are stated as **behaviour** ("never publish a container artifact", "pin the
-digest into GitOps") so the policy outlives today's tools; the detector is the swappable
-implementation. The checker emits a machine-readable report for dashboards / compliance:
+digest into GitOps"), and every run produces **evidence** (with line numbers) plus
+actionable **remediation** on failure. The checker emits a machine-readable report for
+dashboards / compliance, and regenerates its own docs:
 
 ```bash
+# evaluate + JSON report (uploaded as a CI artifact by the guard workflow)
 python3 scripts/check-delivery-model.py .github/workflows/deploy-reusable.yml \
   --format json --report delivery-model-report.json
+
+# regenerate the control table in this README from the catalog
+python3 scripts/check-delivery-model.py --write-docs README.md
 ```
 
 Consumers can assert the behavioral contract via the workflow outputs:

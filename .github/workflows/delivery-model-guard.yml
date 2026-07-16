@@ -25,12 +25,14 @@ on:
       - ".github/workflows/delivery-model-guard.yml"
       - "scripts/check-delivery-model.py"
       - "controls/delivery-model.yaml"
+      - "README.md"
   pull_request:
     paths:
       - ".github/workflows/deploy-reusable.yml"
       - ".github/workflows/delivery-model-guard.yml"
       - "scripts/check-delivery-model.py"
       - "controls/delivery-model.yaml"
+      - "README.md"
   workflow_dispatch: {}
 
 permissions:
@@ -52,6 +54,9 @@ jobs:
 
       - name: Install checker dependency
         run: python3 -m pip install --upgrade PyYAML
+
+      - name: Verify control docs are in sync with the catalog
+        run: python3 scripts/check-delivery-model.py --verify-docs README.md
 
       - name: Enforce delivery-model invariants (ADR-0051 / RFC-0020)
         run: |
