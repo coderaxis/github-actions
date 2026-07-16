@@ -21,7 +21,16 @@ name: Reusable Deploy (canonical build + dev pin)
 #   Promotion Controller promotes the identical digest, gated on Argo CD health.
 #   There is no per-environment rebuild path anywhere.
 #
-# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2.
+# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2. The
+# workflow also exposes a `contract_version` output so callers can assert the behavioral
+# contract they built against.
+#
+# Enforcement (executable governance, not just documentation): the delivery-model
+# invariants above — orchestrate-not-build, build once, dev-only pin, least privilege,
+# main-only, ci-build OIDC role — are machine-verified by scripts/check-delivery-model.py
+# via the delivery-model-guard workflow on every change to this file. Policy SSOT is
+# ADR-0051 + RFC-0020; changing the model here without updating the ADR/RFC and the
+# checker fails the guard. Consumer/maintainer guide: README.md ("Delivery model").
 
 on:
   workflow_call:
@@ -65,6 +74,16 @@ on:
         required: false
         type: string
         default: '["self-hosted", "linux", "x64", "inboxxhq-deploy"]'
+    outputs:
+      # The reusable workflow is a public API for ~40 consuming repos: version its
+      # behavioral contract explicitly. Bump on any breaking change to inputs/outputs
+      # or the delivery model (see ADR-0051). Consumers pin @v1 and MAY assert this.
+      contract_version:
+        description: "Delivery-workflow contract version (e.g. v1). Identifies the behavioral contract independent of the moving @v1 tag."
+        value: ${{ jobs.build-and-pin.outputs.contract_version }}
+      image_digest:
+        description: "Immutable @sha256 digest of the canonical artifact pinned into the dev overlay (the deployment identity promoted unchanged to staging/preprod/prod)."
+        value: ${{ jobs.build-and-pin.outputs.image_digest }}
     secrets:
       # Cross-org callers MUST pass this explicitly. `secrets: inherit` only works
       # within the same org/enterprise; service repos live in a different org than
@@ -156,7 +175,17 @@ jobs:
     name: Build canonical artifact + pin dev
     needs: contract-gate
     runs-on: ${{ fromJSON(inputs.runner) }}
+    outputs:
+      contract_version: ${{ steps.contract.outputs.version }}
+      image_digest: ${{ steps.build.outputs.image_digest }}
     steps:
+      # Behavioral contract version of this reusable workflow (surfaced as a
+      # workflow_call output). Bump when inputs/outputs or the delivery model change.
+      - name: Declare delivery contract version
+        id: contract
+        shell: bash
+        run: echo "version=v1" >> "$GITHUB_OUTPUT"
+
       - name: Validate deployment source branch
         shell: bash
         run: |

@@ -70,6 +70,54 @@ jobs:
 Delivery logic changes are made **once** here and rolled out by moving the `@v1` tag —
 never by editing ~40 service repos.
 
+## Delivery model (enforced, not just documented)
+
+The delivery model is **build once, deploy the digest**. The architectural policy is
+owned by the ADR/RFC (single source of truth) — the workflow implements it and a CI
+guard **enforces** it:
+
+- Architecture SSOT (in the `core-docs` repo): `ADR-0051` (Artifact Promotion,
+  Digest-Pinned Deployment, and Registry Segregation) and `RFC-0020` (Supply-Chain
+  Integrity and Artifact Promotion).
+- Implementation: [`deploy-reusable.yml`](.github/workflows/deploy-reusable.yml).
+- Enforcement: [`scripts/check-delivery-model.py`](scripts/check-delivery-model.py) run
+  by the [`delivery-model-guard`](.github/workflows/delivery-model-guard.yml) self-CI
+  workflow on every change to the reusable workflow or the checker.
+
+This closes the gap where the model existed only as header comments that could drift
+from the implementation. The checker is the **executable form of ADR-0051**; the
+following invariants fail CI if violated:
+
+| # | Invariant | Rationale (ADR-0051) |
+| - | --------- | -------------------- |
+| A | No local container build/publish (`docker build/push`, `buildx`, `podman`, `buildah`, `nerdctl`, `kaniko`, `ko`, `pack`, `buildctl`, `crane push`, `skopeo copy`) in any `run:` block | CI **orchestrates** the central canonical build; CodeBuild `inboxxhq-build` is the **sole publish identity** |
+| B | Exactly one canonical build invocation (`aws codebuild start-build`) | Build **once** — multiple builds imply a per-environment rebuild path |
+| C | Overlay pins target **`dev` only** (no staging/preprod/prod pin or overlay write) | Dev is the first consumer; qualified envs **promote the same digest** — no rebuilds anywhere |
+| D | Least-privilege `permissions` (a subset of `contents: read` + `id-token: write`) | Orchestrator **cannot publish images or mutate clusters** |
+| E | A build-from-`main` guard is present | Trunk-based single-main build |
+| F | AWS auth assumes the ci-build orchestrator role (`inputs.ci_build_role_arn`); no superseded `*deploy*` / `*terraform-apply*` role ARN | Orchestrator identity only — the per-env deploy roles were deleted |
+| G | A `contract_version` `workflow_call` output is declared | The reusable workflow is a versioned public API |
+| H | The header cites `ADR-0051` and `RFC-0020` | Implementation and policy SSOT cannot drift |
+
+Consumers can assert the behavioral contract via the workflow outputs:
+
+```yaml
+jobs:
+  deploy:
+    uses: coderaxis/github-actions/.github/workflows/deploy-reusable.yml@v1
+    with: { service_name: auth-service }
+    secrets: inherit
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.deploy.outputs.contract_version }}" = "v1"
+```
+
+The delivery-model checker is the twin of
+[`scripts/check-seed-contract.py`](scripts/check-seed-contract.py): both encode an
+enterprise standard as a language-agnostic, stdlib-light gate rather than prose.
+
 ## Versioning
 
 - Consumers pin the **major** tag `@v1`, which is a moving tag updated to the latest `v1.x.y`.
