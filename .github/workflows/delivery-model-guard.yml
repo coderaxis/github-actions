@@ -2,11 +2,16 @@ name: Delivery Model Guard
 
 # Self-CI executable governance for the canonical reusable deploy workflow.
 #
-# Runs scripts/check-delivery-model.py (SSOT) against
-# .github/workflows/deploy-reusable.yml on every change, so the build-once /
-# promote-by-digest delivery model cannot silently regress - e.g. someone adding a
-# local image build, pinning a staging/preprod/prod overlay, widening permissions,
+# Runs scripts/check-delivery-model.py against .github/workflows/deploy-reusable.yml
+# on every change, so the build-once / promote-by-digest delivery model cannot silently
+# regress - e.g. someone adding a local image build, a second/per-variant build (incl. a
+# swagger/docs image), pinning a staging/preprod/prod overlay, widening permissions,
 # swapping in a non-ci-build OIDC role, or dropping the main-only guard.
+#
+# The catalog of controls (id, policy, severity) is declarative in
+# controls/delivery-model.yaml; the checker binds each control to a detector. critical/
+# major controls fail CI; minor controls are advisory. A machine-readable JSON report is
+# uploaded as an artifact for dashboards / compliance tooling.
 #
 # Policy SSOT: ADR-0051 (Artifact Promotion, Digest-Pinned Deployment) + RFC-0020
 # (Supply-Chain Integrity and Artifact Promotion). This is the delivery-model twin of
@@ -19,11 +24,13 @@ on:
       - ".github/workflows/deploy-reusable.yml"
       - ".github/workflows/delivery-model-guard.yml"
       - "scripts/check-delivery-model.py"
+      - "controls/delivery-model.yaml"
   pull_request:
     paths:
       - ".github/workflows/deploy-reusable.yml"
       - ".github/workflows/delivery-model-guard.yml"
       - "scripts/check-delivery-model.py"
+      - "controls/delivery-model.yaml"
   workflow_dispatch: {}
 
 permissions:
@@ -47,4 +54,15 @@ jobs:
         run: python3 -m pip install --upgrade PyYAML
 
       - name: Enforce delivery-model invariants (ADR-0051 / RFC-0020)
-        run: python3 scripts/check-delivery-model.py .github/workflows/deploy-reusable.yml
+        run: |
+          python3 scripts/check-delivery-model.py \
+            .github/workflows/deploy-reusable.yml \
+            --report delivery-model-report.json
+
+      - name: Upload delivery-model report (machine-readable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-model-report
+          path: delivery-model-report.json
+          if-no-files-found: warn

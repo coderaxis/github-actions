@@ -85,19 +85,38 @@ guard **enforces** it:
   workflow on every change to the reusable workflow or the checker.
 
 This closes the gap where the model existed only as header comments that could drift
-from the implementation. The checker is the **executable form of ADR-0051**; the
-following invariants fail CI if violated:
+from the implementation. The checker is the **executable form of ADR-0051**.
 
-| # | Invariant | Rationale (ADR-0051) |
-| - | --------- | -------------------- |
-| A | No local container build/publish (`docker build/push`, `buildx`, `podman`, `buildah`, `nerdctl`, `kaniko`, `ko`, `pack`, `buildctl`, `crane push`, `skopeo copy`) in any `run:` block | CI **orchestrates** the central canonical build; CodeBuild `inboxxhq-build` is the **sole publish identity** |
-| B | Exactly one canonical build invocation (`aws codebuild start-build`) | Build **once** — multiple builds imply a per-environment rebuild path |
-| C | Overlay pins target **`dev` only** (no staging/preprod/prod pin or overlay write) | Dev is the first consumer; qualified envs **promote the same digest** — no rebuilds anywhere |
-| D | Least-privilege `permissions` (a subset of `contents: read` + `id-token: write`) | Orchestrator **cannot publish images or mutate clusters** |
-| E | A build-from-`main` guard is present | Trunk-based single-main build |
-| F | AWS auth assumes the ci-build orchestrator role (`inputs.ci_build_role_arn`); no superseded `*deploy*` / `*terraform-apply*` role ARN | Orchestrator identity only — the per-env deploy roles were deleted |
-| G | A `contract_version` `workflow_call` output is declared | The reusable workflow is a versioned public API |
-| H | The header cites `ADR-0051` and `RFC-0020` | Implementation and policy SSOT cannot drift |
+### Control catalog (declarative + severity-aware)
+
+The controls — their id, human-readable policy, and severity — are declared in
+[`controls/delivery-model.yaml`](controls/delivery-model.yaml). The checker binds each
+control to a detector and evaluates it. **critical/major** controls fail CI; **minor**
+controls are advisory (warnings). Tune the gate with `--fail-on {critical,major,minor}`.
+
+| Control | Policy | Severity |
+| ------- | ------ | -------- |
+| DM-001 | CI never builds or publishes a container artifact | critical |
+| DM-002 | Exactly one canonical build; **no per-environment or per-variant builds** | critical |
+| DM-003 | Only the `dev` overlay is written; qualified envs are promoted, never pinned here | critical |
+| DM-004 | CI assumes only the ci-build orchestrator identity (no `*deploy*`/`*terraform-apply*` role) | critical |
+| DM-005 | **No docs/build-variant tag injected into the canonical build** (no `GO_BUILD_TAGS=swagger`, `-tags swagger`) | critical |
+| DM-006 | Least-privilege permissions (⊆ `contents: read` + `id-token: write`) | major |
+| DM-007 | The canonical artifact is built from `main` (trunk-based) | major |
+| DM-008 | OIDC credentials are configured (no long-lived keys) | major |
+| DM-009 | The immutable digest is pinned into GitOps (behaviour, not a specific script name) | major |
+| DM-010 | `contract_version` output is declared (versioned public API) | major |
+| DM-011 | `image_digest` output is declared | minor |
+| DM-012 | The workflow cites its governing policy SSOT (`ADR-0051`, `RFC-0020`) | minor |
+
+Controls are stated as **behaviour** ("never publish a container artifact", "pin the
+digest into GitOps") so the policy outlives today's tools; the detector is the swappable
+implementation. The checker emits a machine-readable report for dashboards / compliance:
+
+```bash
+python3 scripts/check-delivery-model.py .github/workflows/deploy-reusable.yml \
+  --format json --report delivery-model-report.json
+```
 
 Consumers can assert the behavioral contract via the workflow outputs:
 
@@ -113,6 +132,25 @@ jobs:
     steps:
       - run: test "${{ needs.deploy.outputs.contract_version }}" = "v1"
 ```
+
+### API docs (Swagger) and the single artifact
+
+There is **one** canonical image for all environments — there is **no** "with Swagger"
+and "without Swagger" build. Swagger is **never compiled into the canonical image**
+(`GO_BUILD_TAGS=""`; the `//go:build !swagger` no-op stub is linked), so the *same*
+swagger-less digest is promoted to `dev → staging → preprod → prod`. Building a second
+docs/no-docs image would break build-once and is rejected by **DM-002** and **DM-005**.
+
+Developers still get docs — just not from the deployed service:
+
+- **Locally**: `go run -tags swagger …` links the real docs implementation.
+- **Centrally**: `docs/openapi.json` is published to the API contract registry
+  (`inboxxhq-api-contracts`) and served from a central OpenAPI/Swagger portal.
+- **Defense-in-depth**: even if a swagger-tagged build were ever deployed, the runtime
+  `swaggerpolicy.DocsEnabled(environment)` policy (dev/staging on, preprod/prod off)
+  gates the endpoints. The compile-time exclusion is the primary control; this is the
+  backstop. (See `platform/openapiroutes` and `platform/swaggerpolicy` in
+  `platform-shared-go`.)
 
 The delivery-model checker is the twin of
 [`scripts/check-seed-contract.py`](scripts/check-seed-contract.py): both encode an

@@ -21,16 +21,22 @@ name: Reusable Deploy (canonical build + dev pin)
 #   Promotion Controller promotes the identical digest, gated on Argo CD health.
 #   There is no per-environment rebuild path anywhere.
 #
+#   Single artifact, no variants: the SAME image is promoted to every env. There is
+#   no "with-swagger"/"without-swagger" build — swagger is never compiled into the
+#   canonical image (GO_BUILD_TAGS=""); developer docs come from local `-tags swagger`
+#   builds and the central contract registry, not the deployed service.
+#
 # Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2. The
 # workflow also exposes a `contract_version` output so callers can assert the behavioral
 # contract they built against.
 #
 # Enforcement (executable governance, not just documentation): the delivery-model
-# invariants above — orchestrate-not-build, build once, dev-only pin, least privilege,
-# main-only, ci-build OIDC role — are machine-verified by scripts/check-delivery-model.py
-# via the delivery-model-guard workflow on every change to this file. Policy SSOT is
-# ADR-0051 + RFC-0020; changing the model here without updating the ADR/RFC and the
-# checker fails the guard. Consumer/maintainer guide: README.md ("Delivery model").
+# invariants above — orchestrate-not-build, build once (no per-env/per-variant image),
+# dev-only pin, least privilege, main-only, ci-build OIDC role — are machine-verified by
+# scripts/check-delivery-model.py via the delivery-model-guard workflow on every change
+# to this file. Controls (id/policy/severity) are declared in controls/delivery-model.yaml.
+# Policy SSOT is ADR-0051 + RFC-0020; changing the model here without updating the ADR/RFC
+# and the catalog fails the guard. Consumer/maintainer guide: README.md ("Delivery model").
 
 on:
   workflow_call:
