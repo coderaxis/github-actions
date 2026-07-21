@@ -1,0 +1,161 @@
+name: Reusable Schema Compatibility
+
+# Central, single-source schema-compatibility + canonical-outbox-conformance gate
+# for the coderaxis platform. Consumed by every *-core-postgres repo via a thin
+# caller (see README, "Reusable workflows"):
+#
+#   jobs:
+#     schema-compatibility:
+#       uses: coderaxis/github-actions/.github/workflows/schema-compatibility.yml@v1
+#       with:
+#         table: auth_service_outbox      # omit to skip outbox conformance
+#       secrets: inherit                  # REQUIRED: passes the module-read App creds
+#
+# What it does (single source of truth — change here, roll the @v1 tag, never
+# edit ~27 core-postgres repos):
+#   1. Spin an ephemeral postgres:18 and mint a short-lived GitHub-App module-read
+#      token (private-module fetch), exactly like the per-repo gate used to.
+#   2. Apply the repo's migrations to HEAD via the shared, auto-detecting ladder in
+#      scripts/schema-compat.sh (goose round-trip test -> schema.GooseUpDSN ->
+#      embedded schema.Migrate baseline -> static SQL lint). This fixes the
+#      long-standing "goose gap" where pure-goose repos silently fell through to a
+#      static lint and never actually migrated.
+#   3. If `table` is set, run the shared canonical-outbox verifier (RFC-0032 /
+#      ADR-0069) against the live table and fail closed on ANY semantic drift
+#      (columns/types/defaults/domain/PK/unique/checks/partitioning). The verifier
+#      version is pinned HERE (outbox_verify_version), so the contract is tightened
+#      fleet-wide from one place with zero per-repo go.mod churn.
+#
+# The checker logic lives ONCE in this repo (SSOT). Service repos vendor nothing:
+# the reusable checks this repo out alongside the caller and runs the pinned script.
+#
+# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2.
+
+on:
+  workflow_call:
+    inputs:
+      table:
+        description: "Outbox table to verify against the canonical contract (e.g. auth_service_outbox). Empty = skip outbox conformance; migration apply/validate still runs."
+        required: false
+        type: string
+        default: ""
+      outbox_verify_version:
+        description: "platform-shared-go version providing cmd/outbox-verify (the canonical contract). Pinned centrally; bump to tighten the contract fleet-wide."
+        required: false
+        type: string
+        default: v1.7.0
+      migrate_cmd:
+        description: "Optional override for the migrate step (a repo that doesn't fit the auto-ladder). Must leave the DB at HEAD using $TEST_DATABASE_URL/$DATABASE_URL."
+        required: false
+        type: string
+        default: ""
+      go_version_file:
+        description: "Path to the go.mod that pins the Go toolchain."
+        required: false
+        type: string
+        default: go.mod
+      actions_ref:
+        description: "Ref of coderaxis/github-actions providing the SSOT script (defaults to the moving major tag)."
+        required: false
+        type: string
+        default: v1
+      runs_on:
+        description: "runs-on label for the job."
+        required: false
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  schema-compatibility:
+    name: Schema compatibility
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: schema_compat_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GOPRIVATE: github.com/coderaxis/*
+      GONOSUMDB: github.com/coderaxis/*
+      GONOSUMCHECK: "1"
+    steps:
+      - name: Checkout service (caller)
+        uses: actions/checkout@v4
+
+      - name: Checkout central SSOT (schema-compat script)
+        uses: actions/checkout@v4
+        with:
+          repository: coderaxis/github-actions
+          ref: ${{ inputs.actions_ref }}
+          path: .coderaxis-ci
+
+      - name: Resolve Postgres connection URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${{ job.services.postgres.ports['5432'] }}"
+          URL="postgres://postgres:postgres@127.0.0.1:${PORT}/schema_compat_test?sslmode=disable"
+          {
+            echo "DB_HOST=127.0.0.1"
+            echo "DB_PORT=${PORT}"
+            echo "POSTGRES_PORT=${PORT}"
+            echo "TEST_DATABASE_URL=${URL}"
+            echo "DATABASE_URL=${URL}"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        if: hashFiles(inputs.go_version_file) != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go_version_file }}
+          cache: false
+
+      - name: Mint module-read token (GitHub App)
+        if: hashFiles(inputs.go_version_file) != ''
+        id: modauth
+        uses: coderaxis/github-actions/module-auth@v1
+        with:
+          app-id: ${{ secrets.CODERAXIS_APP_ID }}
+          private-key: ${{ secrets.CODERAXIS_APP_PRIVATE_KEY }}
+
+      - name: Configure private module access
+        if: hashFiles(inputs.go_version_file) != ''
+        shell: bash
+        env:
+          MOD_TOKEN: ${{ steps.modauth.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${MOD_TOKEN}" ]]; then
+            git config --global url."https://x-access-token:${MOD_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+          GOWORK=off go mod download
+
+      - name: Schema compatibility + canonical outbox conformance
+        shell: bash
+        env:
+          OUTBOX_TABLE: ${{ inputs.table }}
+          OUTBOX_VERIFY_VERSION: ${{ inputs.outbox_verify_version }}
+          MIGRATE_CMD: ${{ inputs.migrate_cmd }}
+          DB_USERNAME: postgres
+          DB_USER: postgres
+          POSTGRES_USER: postgres
+          DB_PASSWORD: postgres
+          POSTGRES_PASSWORD: postgres
+          DB_NAME: schema_compat_test
+          POSTGRES_DB: schema_compat_test
+          DB_SSLMODE: disable
+          ENVIRONMENT: test
+        run: bash .coderaxis-ci/scripts/schema-compat.sh

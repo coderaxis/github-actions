@@ -33,6 +33,7 @@ live under `.github/workflows/` and are consumed via `uses:` at the **job** leve
 | -------- | ------- |
 | [`deploy-reusable.yml`](.github/workflows/deploy-reusable.yml) | InboxxHQ GitOps delivery — CI orchestrates the central canonical build (`inboxxhq-build`), reads back the signed image **digest**, and pins it into the `dev` overlay (first consumer). staging/preprod/prod promote the same digest via the Promotion Controller. **Build once, deploy the digest.** |
 | [`seed-contract-check.yml`](.github/workflows/seed-contract-check.yml) | Language-agnostic seeding-contract gate (seeding standard §6b) — Dockerfile seed-binary marker + `seed/data` copy, canonical `system/dev/staging/preprod/prod` tree, placeholder-only qualified envs, no `SEED_COMMAND=""` override. Runs the pinned [`scripts/check-seed-contract.py`](scripts/check-seed-contract.py) (SSOT) against the caller; stateless services self-skip. |
+| [`schema-compatibility.yml`](.github/workflows/schema-compatibility.yml) | Schema-migration + canonical-outbox-conformance gate for every `*-core-postgres` repo — spins an ephemeral `postgres:18`, applies the repo's migrations to HEAD via an auto-detecting ladder (goose round-trip test → `schema.GooseUpDSN` → embedded `schema.Migrate` → static lint; fixes the old "goose gap" where pure-goose repos never actually migrated), then runs the centrally-pinned canonical **outbox verifier** (RFC-0032 / ADR-0069) and fails closed on ANY semantic drift (columns/types/defaults/domain/PK/unique/checks/partitioning). Runs the SSOT [`scripts/schema-compat.sh`](scripts/schema-compat.sh) against the caller. |
 
 Each service repo carries only a thin caller:
 
@@ -67,8 +68,30 @@ jobs:
     uses: coderaxis/github-actions/.github/workflows/seed-contract-check.yml@v1
 ```
 
+Every `*-core-postgres` repo carries a thin schema-compatibility caller (the only
+per-repo input is the outbox table name; omit it for a repo without an outbox):
+
+```yaml
+# .github/workflows/schema-compatibility.yml
+on:
+  pull_request:
+    paths: ["schema/**", "sql/**", "sqlc.yaml", "go.mod", "go.sum", ".github/workflows/schema-compatibility.yml"]
+  push: { branches: ["**"] }
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  schema-compatibility:
+    uses: coderaxis/github-actions/.github/workflows/schema-compatibility.yml@v1
+    with:
+      table: auth_service_outbox   # the repo's outbox table; omit to skip outbox conformance
+    secrets: inherit               # REQUIRED: inherits the module-read App creds for private go deps
+```
+
 Delivery logic changes are made **once** here and rolled out by moving the `@v1` tag —
-never by editing ~40 service repos.
+never by editing ~40 service repos. The outbox **contract version** is likewise pinned
+once here (`outbox_verify_version`), so tightening it is a one-line change in this repo,
+not a fleet-wide `go.mod` bump.
 
 ## Delivery model (enforced, not just documented)
 
