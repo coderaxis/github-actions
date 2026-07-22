@@ -47,11 +47,15 @@ set -euo pipefail
 : "${TEST_DATABASE_URL:?schema-compat: TEST_DATABASE_URL must be set}"
 export DATABASE_URL="${DATABASE_URL:-${TEST_DATABASE_URL}}"
 TABLE="${OUTBOX_TABLE:-}"
-# v1.9.1: canonical outbox identity contract — event_id is a fresh per-occurrence
-# uuidv7() (DB default) and dedup_key is the producer-minted DETERMINISTIC
-# idempotency key (NOT NULL, no default) (RFC-0032 / ADR-0071). Bumped from the
-# pre-split v1.7.0 (which forbade an event_id default and had no dedup_key).
-VERIFY_VERSION="${OUTBOX_VERIFY_VERSION:-v1.9.1}"
+# v1.10.0: canonical outbox identity contract — event_id is a fresh
+# per-occurrence uuidv7() (DB default) and idempotency_key is the
+# producer-minted DETERMINISTIC idempotency key (NOT NULL, no default)
+# (RFC-0032 / ADR-0071). v1.9.1 briefly named this column dedup_key; v1.10.0
+# renamed it back to idempotency_key to align with the terminology already
+# used across every other *-core-postgres outbox table on the platform.
+# Bumped from the pre-split v1.7.0 (which forbade an event_id default and had
+# no idempotency_key/dedup_key column at all).
+VERIFY_VERSION="${OUTBOX_VERIFY_VERSION:-v1.10.0}"
 MIGRATE_CMD_OVERRIDE="${MIGRATE_CMD:-}"
 
 GENDIR=".schema-compat-gen"

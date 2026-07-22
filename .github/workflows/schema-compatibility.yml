@@ -43,7 +43,7 @@ on:
         description: "platform-shared-go version providing cmd/outbox-verify (the canonical contract). Pinned centrally; bump to tighten the contract fleet-wide."
         required: false
         type: string
-        default: v1.9.1
+        default: v1.10.0
       migrate_cmd:
         description: "Optional override for the migrate step (a repo that doesn't fit the auto-ladder). Must leave the DB at HEAD using $TEST_DATABASE_URL/$DATABASE_URL."
         required: false
