@@ -1,0 +1,77 @@
+name: Dockerfile Standard
+
+# Reusable workflow — the executable form of the Enterprise Dockerfile Standard
+# (docs/core-docs/standards/infrastructure/dockerfile-standard.md, ADR-0072).
+#
+# Every caller declares its `capabilities` (comma-separated, from
+# dockerfile-capability-matrix.yaml: http-api, db-owner, seed, backfill, canary,
+# kafka-producer-dk, worker, gateway, stateless). Static analysis only — this workflow
+# never runs `docker build` and never publishes an image (ADR-0051 DM-001 stays intact).
+#
+# critical/major controls fail CI; minor is advisory (--fail-on). A machine-readable JSON
+# report is uploaded as an artifact for dashboards / compliance tooling, exactly like
+# delivery-model-guard and schema-compatibility.
+
+on:
+  workflow_call:
+    inputs:
+      capabilities:
+        description: >-
+          Comma-separated declared capabilities for this repo (see
+          dockerfile-capability-matrix.yaml). Example: "http-api,db-owner,seed"
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile to check (relative to repo root)
+        required: false
+        type: string
+        default: Dockerfile
+      fail_on:
+        description: Minimum severity that fails CI (critical|major|minor)
+        required: false
+        type: string
+        default: major
+
+jobs:
+  dockerfile-standard:
+    name: Dockerfile standard invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Checkout coderaxis/github-actions (checker SSOT)
+        uses: actions/checkout@v4
+        with:
+          repository: coderaxis/github-actions
+          ref: v1
+          path: .dockerfile-standard-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checker dependency
+        run: python3 -m pip install --upgrade PyYAML
+
+      - name: Enforce Dockerfile standard (ADR-0072)
+        run: |
+          python3 .dockerfile-standard-tools/scripts/check-dockerfile-standard.py \
+            "${{ inputs.dockerfile }}" \
+            --repo-root . \
+            --capabilities "${{ inputs.capabilities }}" \
+            --controls .dockerfile-standard-tools/controls/dockerfile-standard.yaml \
+            --fail-on "${{ inputs.fail_on }}" \
+            --report dockerfile-standard-report.json
+
+      - name: Upload dockerfile-standard report (machine-readable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerfile-standard-report
+          path: dockerfile-standard-report.json
+          if-no-files-found: warn

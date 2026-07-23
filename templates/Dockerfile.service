@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1.7
+#
+# CANONICAL Dockerfile template — Enterprise Dockerfile Standard
+# (docs/core-docs/standards/infrastructure/dockerfile-standard.md, ADR-0072).
+#
+# HOW TO INSTANTIATE THIS TEMPLATE:
+#   Copy this file into a service repo as `Dockerfile`, then do a ONE-TIME literal
+#   find-and-replace of every __PLACEHOLDER__ token (they are plain text substitutions
+#   filled in once, NOT Docker ARGs — CMD in exec form and the HEALTHCHECK shell command
+#   run inside the container at runtime and cannot expand a build-time ARG, so the binary
+#   name/port must be literal text in this file, exactly like every Dockerfile in the
+#   fleet today):
+#     __SERVICE_NAME__      e.g. billing        (no inboxxhq-/skentra- tenant prefix)
+#     __REPO_NAME__         e.g. inboxxhq-billing-service
+#     __CAPABILITY_LIST__   e.g. http-api,db-owner,seed  (must match
+#                            dockerfile-capability-matrix.yaml exactly)
+#     __SERVICE_PORT__      e.g. 4000
+#   Then delete the capability blocks below that this repo does NOT declare, and
+#   uncomment the ones it does. Do not add anything not covered by a capability in
+#   dockerfile-capability-matrix.yaml.
+#
+# Everything using real ${ARG_NAME} syntax below IS a genuine build-time Docker ARG,
+# centrally versioned in dockerfile-version-matrix.yaml — never hardcode a different
+# value for one of these; change the version matrix and bump the default here in the
+# same PR.
+#
+# Private modules are fetched with a BuildKit secret so the token is never baked into any
+# image layer. Build from this service directory as the Docker context.
+
+ARG BUILDER_IMAGE_TAG=1.26-alpine3.19
+ARG RUNTIME_IMAGE_TAG=3.19
+ARG GO_LANG_VERSION=1.25
+ARG TARGETARCH=arm64
+
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:${BUILDER_IMAGE_TAG} AS builder
+
+ARG TARGETARCH
+ARG GO_LANG_VERSION
+ARG GO_BUILD_TAGS=""
+
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+        if apk add --no-cache ca-certificates git tzdata; then \
+            break; \
+        fi; \
+        if [ "$attempt" -eq 5 ]; then \
+            echo "apk install failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        sleep $((attempt * 2)); \
+    done
+
+# NOTE: GO_LANG_VERSION pins the compiler's *language* version, currently one minor below
+# the toolchain (see dockerfile-standard.md §11 — this predates the standard and has no
+# recorded rationale; centralized here as an explicit, auditable knob pending a
+# platform-architecture decision on whether it is still required at all).
+ENV GOFLAGS="-gcflags=all=-lang=go${GO_LANG_VERSION}"
+ENV GOPRIVATE=github.com/coderaxis/*
+ENV GONOSUMDB=github.com/coderaxis/*
+ENV GOWORK=off
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+
+RUN --mount=type=secret,id=gh_token \
+    GH_TOKEN="$(cat /run/secrets/gh_token)" && \
+    git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/" && \
+    go mod download && \
+    git config --global --unset url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf || true
+
+COPY . .
+
+# --- Required: main server binary ---------------------------------------------------
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -tags "${GO_BUILD_TAGS}" \
+    -a -installsuffix cgo -o __SERVICE_NAME__-service ./cmd/server
+
+# --- Capability: db-owner (declared in dockerfile-capability-matrix.yaml) -----------
+# Uncomment if this repo owns a <family>-core-postgres module.
+# RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
+#     -o __SERVICE_NAME__-service-dbtool ./cmd/dbtool
+
+# --- Capability: seed ----------------------------------------------------------------
+# Uncomment if this repo ships cmd/seed.
+# RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
+#     -o __SERVICE_NAME__-service-seed ./cmd/seed
+
+# --- Capability: backfill -------------------------------------------------------------
+# Uncomment if this repo ships cmd/backfill.
+# RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
+#     -o __SERVICE_NAME__-service-backfill ./cmd/backfill
+
+# --- Capability: canary ---------------------------------------------------------------
+# Uncomment if this repo ships cmd/canary.
+# RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
+#     -o __SERVICE_NAME__-service-canary ./cmd/canary
+
+FROM public.ecr.aws/docker/library/alpine:${RUNTIME_IMAGE_TAG}
+
+ARG RUNTIME_UID=10001
+ARG RUNTIME_GID=10001
+# Supplied by the central build (inboxxhq-build) as --build-arg at build time; never
+# hardcoded here. Used only in LABEL (build-time only; not needed at container runtime).
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_CREATED=unknown
+
+LABEL org.opencontainers.image.title="__SERVICE_NAME__" \
+      org.opencontainers.image.source="https://github.com/coderaxis/__REPO_NAME__" \
+      org.opencontainers.image.vendor="coderaxis" \
+      org.opencontainers.image.licenses="UNLICENSED" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.created="${IMAGE_CREATED}" \
+      com.coderaxis.capabilities="__CAPABILITY_LIST__"
+
+RUN set -eux; \
+    for attempt in 1 2 3 4 5; do \
+        if apk add --no-cache ca-certificates tzdata wget; then \
+            break; \
+        fi; \
+        if [ "$attempt" -eq 5 ]; then \
+            echo "apk install failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        sleep $((attempt * 2)); \
+    done; \
+    addgroup -g ${RUNTIME_GID} -S appuser && \
+    adduser -u ${RUNTIME_UID} -S -G appuser -s /bin/sh appuser
+
+WORKDIR /app
+
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/__SERVICE_NAME__-service .
+
+# --- Capability: db-owner -------------------------------------------------------------
+# dbtool binary path: /app/__SERVICE_NAME__-service-dbtool
+# COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/__SERVICE_NAME__-service-dbtool .
+
+# --- Capability: seed ------------------------------------------------------------------
+# seed binary path: /app/__SERVICE_NAME__-service-seed
+# COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/__SERVICE_NAME__-service-seed .
+# COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/internal/platform/database/seed/data ./internal/platform/database/seed/data
+
+# --- Capability: backfill --------------------------------------------------------------
+# backfill binary path: /app/__SERVICE_NAME__-service-backfill
+# COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/__SERVICE_NAME__-service-backfill .
+
+# --- Capability: canary ----------------------------------------------------------------
+# canary binary path: /app/__SERVICE_NAME__-service-canary
+# COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/__SERVICE_NAME__-service-canary .
+
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/docs ./docs
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/scripts ./scripts
+COPY --from=builder --chown=${RUNTIME_UID}:${RUNTIME_GID} /app/env.example .
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+EXPOSE __SERVICE_PORT__
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 -O /dev/null http://localhost:__SERVICE_PORT__/health || exit 1
+
+CMD ["./__SERVICE_NAME__-service"]

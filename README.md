@@ -33,7 +33,9 @@ live under `.github/workflows/` and are consumed via `uses:` at the **job** leve
 | -------- | ------- |
 | [`deploy-reusable.yml`](.github/workflows/deploy-reusable.yml) | InboxxHQ GitOps delivery — CI orchestrates the central canonical build (`inboxxhq-build`), reads back the signed image **digest**, and pins it into the `dev` overlay (first consumer). staging/preprod/prod promote the same digest via the Promotion Controller. **Build once, deploy the digest.** |
 | [`seed-contract-check.yml`](.github/workflows/seed-contract-check.yml) | Language-agnostic seeding-contract gate (seeding standard §6b) — Dockerfile seed-binary marker + `seed/data` copy, canonical `system/dev/staging/preprod/prod` tree, placeholder-only qualified envs, no `SEED_COMMAND=""` override. Runs the pinned [`scripts/check-seed-contract.py`](scripts/check-seed-contract.py) (SSOT) against the caller; stateless services self-skip. |
-| [`schema-compatibility.yml`](.github/workflows/schema-compatibility.yml) | Schema-migration + canonical-outbox-conformance gate for every `*-core-postgres` repo — spins an ephemeral `postgres:18`, applies the repo's migrations to HEAD via an auto-detecting ladder (goose round-trip test → `schema.GooseUpDSN` → embedded `schema.Migrate` → static lint; fixes the old "goose gap" where pure-goose repos never actually migrated), then runs the centrally-pinned canonical **outbox verifier** (RFC-0032 / ADR-0069) and fails closed on ANY semantic drift (columns/types/defaults/domain/PK/unique/checks/partitioning). Runs the SSOT [`scripts/schema-compat.sh`](scripts/schema-compat.sh) against the caller. |
+| [`schema-compatibility.yml`](.github/workflows/schema-compatibility.yml) | Schema-**path/layout** + schema-migration + canonical-outbox-conformance gate for every `*-core-postgres` repo. First, `check_schema_layout` fails fast (before touching any DB) if the repo carries a `.sql` file anywhere other than `schema/migrations/` (the migration chain), `sql/queries/` (sqlc query source), `schema/seed*.sql` (dev/role seed data), `seed/` (the platform seeding-standard tree), or `testdata/` (Go test fixtures) — or if `schema/migrations/` is missing the required `000001_init.up.sql` + `000001_init.down.sql` baseline pair (additional forward migrations, e.g. `000002_...`, are always welcome and never capped). It then spins an ephemeral `postgres:18`, applies the repo's migrations to HEAD via an auto-detecting ladder (goose round-trip test → `schema.GooseUpDSN` → embedded `schema.Migrate` → static lint; fixes the old "goose gap" where pure-goose repos never actually migrated), then runs the centrally-pinned canonical **outbox verifier** (RFC-0032 / ADR-0069) and fails closed on ANY semantic drift (columns/types/defaults/domain/PK/unique/checks/partitioning). Runs the SSOT [`scripts/schema-compat.sh`](scripts/schema-compat.sh) against the caller. The same layout rule is enforced locally/offline, fleet-wide at once, by `inboxxhq-infra`'s `scripts/check-migration-filename-consistency.py --only-core-postgres-init`. |
+| [`dockerfile-standard.yml`](.github/workflows/dockerfile-standard.yml) | Enterprise Dockerfile Standard gate (ADR-0072) — static analysis only, never runs `docker build`/pushes an image (keeps ADR-0051 DM-001 intact). Every caller declares its `capabilities` (comma list from `dockerfile-capability-matrix.yaml`: `http-api`, `db-owner`, `seed`, `backfill`, `canary`, `kafka-producer-dk`, `worker`, `gateway`, `stateless`). Checks the canonical two-stage layout, centrally pinned base-image versions, a numeric non-root `USER`, required OCI labels, exec-form `CMD`, `STOPSIGNAL`, a `db-owner` repo shipping a `dbtool` binary, capability-declaration-matches-repo-reality, no build-time codegen, no `ADD`, no freeform version ARGs, the BuildKit secret-mount pattern for private-module credentials, and an `apk add` package allow-list. Deliberately does not duplicate `seed-contract-check.yml`'s hard enforcement (its seed check here is advisory-only). Runs the SSOT [`scripts/check-dockerfile-standard.py`](scripts/check-dockerfile-standard.py) against the caller's own Dockerfile + repo structure. |
+| [`event-handling-compliance.yml`](.github/workflows/event-handling-compliance.yml) | Event-handling compliance gate — the executable form of `services/ENTERPRISE_NOTIFICATION_PATTERN.md` §7/§8. Every caller declares its family `role` (`P`\|`H`\|`DK`\|`Hybrid`\|`E`\|`Bridge`, per the §7 matrix): `P`/`H` (owns Postgres) may **never** construct a raw Kafka producer — domain events must flow exclusively through the transactional outbox (`platform-shared-go/outbox`) + Debezium CDC; `DK`/`Hybrid` may produce directly but only via the canonical `platform-shared-go/messaging/kafka` envelope, and every topic string found must be in the declared `allowed_topics`; `E`/`Bridge` are unrestricted (true exception / the sanctioned CDC-polling canonicalizer). Also reports (advisory, non-blocking) any raw `sarama.NewConsumerGroup` not wrapped by the shared `events.EnterpriseConsumer` (retry/DLQ/tracing/health). Pure static analysis via the SSOT [`scripts/event-compliance.sh`](scripts/event-compliance.sh) — no DB/broker needed. |
 
 Each service repo carries only a thin caller:
 
@@ -92,6 +94,61 @@ Delivery logic changes are made **once** here and rolled out by moving the `@v1`
 never by editing ~40 service repos. The outbox **contract version** is likewise pinned
 once here (`outbox_verify_version`), so tightening it is a one-line change in this repo,
 not a fleet-wide `go.mod` bump.
+
+Every deployable service repo also carries a thin event-handling-compliance caller (the
+only per-repo input is its `role` from the `ENTERPRISE_NOTIFICATION_PATTERN.md` §7
+matrix; `allowed_topics` is required only for `DK`/`Hybrid`):
+
+```yaml
+# .github/workflows/event-handling-compliance.yml
+on:
+  pull_request:
+    paths: ["**/*.go", "go.mod", "go.sum", ".github/workflows/event-handling-compliance.yml"]
+  push: { branches: ["**"] }
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  event-handling-compliance:
+    uses: coderaxis/github-actions/.github/workflows/event-handling-compliance.yml@v1
+    with:
+      role: P                               # P | H | DK | Hybrid | E | Bridge
+      # allowed_topics: "inboxxhq.chat.messages"   # required for DK/Hybrid only
+```
+
+Every Go backend deployable repo (`services/**`, `gateways/**`) also carries a thin
+dockerfile-standard caller (the only per-repo input is its `capabilities`, from
+[`dockerfile-capability-matrix.yaml`](https://github.com/coderaxis/microservices/blob/main/docs/core-docs/standards/infrastructure/dockerfile-capability-matrix.yaml)
+in `coderaxis/microservices`):
+
+```yaml
+# .github/workflows/dockerfile-standard.yml
+on:
+  pull_request:
+    paths: ["Dockerfile", ".github/workflows/dockerfile-standard.yml"]
+  push: { branches: ["**"] }
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  dockerfile-standard:
+    uses: coderaxis/github-actions/.github/workflows/dockerfile-standard.yml@v1
+    with:
+      capabilities: "http-api,db-owner,seed"   # from dockerfile-capability-matrix.yaml
+      # fail_on: minor                          # default is major; tighten once a repo's
+                                                 # remediation batch is green (see the
+                                                 # fleet audit report)
+```
+
+The canonical Dockerfile every repo derives from lives at
+[`templates/Dockerfile.service`](templates/Dockerfile.service) — copy it in, fill in the
+`__PLACEHOLDER__` tokens (service name, repo name, capability list, port), uncomment the
+capability blocks this repo declares, and delete the rest. Every version referenced by it
+is centrally pinned in
+[`dockerfile-version-matrix.yaml`](https://github.com/coderaxis/microservices/blob/main/docs/core-docs/standards/infrastructure/dockerfile-version-matrix.yaml)
+(coderaxis/microservices) — a fleet-wide bump is a one-line change there plus a bump of
+this repo's `EXPECTED_BUILDER_TAG`/`EXPECTED_RUNTIME_TAG` constants, never ~40 individual
+Dockerfile edits.
 
 ## Delivery model (enforced, not just documented)
 
@@ -196,6 +253,55 @@ Developers still get docs — just not from the deployed service:
 The delivery-model checker is the twin of
 [`scripts/check-seed-contract.py`](scripts/check-seed-contract.py): both encode an
 enterprise standard as a language-agnostic, stdlib-light gate rather than prose.
+
+## Dockerfile standard (one canonical pattern, capability-declared variation)
+
+Policy SSOT (in `coderaxis/microservices`): `ADR-0072` (Enterprise Dockerfile Standard) and
+the [Enterprise Dockerfile Standard](https://github.com/coderaxis/microservices/blob/main/docs/core-docs/standards/infrastructure/dockerfile-standard.md).
+Implementation: [`templates/Dockerfile.service`](templates/Dockerfile.service).
+Enforcement: [`scripts/check-dockerfile-standard.py`](scripts/check-dockerfile-standard.py)
+run by [`dockerfile-standard.yml`](.github/workflows/dockerfile-standard.yml) against every
+caller, and self-checked by
+[`dockerfile-standard-guard.yml`](.github/workflows/dockerfile-standard-guard.yml) on every
+change to the catalog/checker/template. Static analysis only — never runs `docker build`,
+so it cannot conflict with DM-001 above.
+
+### Control catalog (policy-as-code)
+
+The controls are declared in
+[`controls/dockerfile-standard.yaml`](controls/dockerfile-standard.yaml) — same
+policy-only-catalog / evolvable-detector split as `controls/delivery-model.yaml`. Each
+control additionally carries `applies_to_capabilities`: an empty list means it applies to
+every caller; a non-empty list means it is only evaluated when the caller's declared
+`capabilities` intersects it (e.g. `db-owner`-only controls don't fire for a stateless
+gateway). The table below is generated from the catalog (drift-gated via `--verify-docs`):
+
+<!-- BEGIN dockerfile-standard-controls (generated: scripts/check-dockerfile-standard.py --write-docs) -->
+
+_Generated from `controls/dockerfile-standard.yaml` by `scripts/check-dockerfile-standard.py --write-docs` — do not edit by hand._
+
+| Control | Policy | Severity | Capability scope | Owner | Status |
+| ------- | ------ | -------- | ----------------- | ----- | ------ |
+| DS-001 | Exactly one builder stage named `builder` (golang base) and exactly one unnamed runtime stage (alpine base). No third stage. | critical | all | platform-infrastructure | active |
+| DS-002 | The builder stage's FROM MUST use `--platform=$BUILDPLATFORM`, and the build MUST set `GOARCH=${TARGETARCH}` (or equivalent) so the target architecture is cross-compiled, not emulated. | major | all | platform-infrastructure | active |
+| DS-003 | The builder image tag and runtime image tag MUST equal the values pinned in dockerfile-version-matrix.yaml (currently `1.26-alpine3.19` / `3.19`). A Dockerfile MUST NOT pin a different version independently, and MUST NOT use a floating tag that omits the Alpine sub-version (e.g. bare `golang:1.26-alpine`). | major | all | platform-infrastructure | active |
+| DS-004 | No `FROM ...:latest` (implicit or explicit) and no unpinned `FROM` (a bare `image_name` with no tag at all, which Docker resolves to `:latest`). | critical | all | platform-security | active |
+| DS-005 | The runtime stage MUST create its user with an explicit, pinned numeric UID/GID (matching dockerfile-version-matrix.yaml `runtime_user`, currently 10001:10001) and the final `USER` instruction MUST reference that numeric UID:GID, never a bare symbolic username with no numeric pin, and never root (UID 0 / no USER instruction at all). | critical | all | platform-security | active |
+| DS-006 | A HEALTHCHECK instruction MUST be present, and its target port MUST equal the port in EXPOSE. | major | http-api, gateway | platform-infrastructure | active |
+| DS-007 | A `worker`-only caller (no `http-api`) MUST NOT use an HTTP HEALTHCHECK (no HTTP port is bound) but MUST still declare SOME HEALTHCHECK (process/file/socket-based) - omitting HEALTHCHECK entirely is not an acceptable substitute. | minor | worker | platform-infrastructure | active |
+| DS-008 | The runtime stage MUST carry LABEL org.opencontainers.image.title, .source, .vendor, .licenses, .revision, .created, and com.coderaxis.capabilities. | major | all | platform-infrastructure | active |
+| DS-009 | CMD (or ENTRYPOINT) MUST be JSON exec form (`["./binary"]`), never a shell string. No ENTRYPOINT shell-script wrapper (`entrypoint.sh`) is permitted - the compiled binary IS the entrypoint. | critical | all | platform-infrastructure | active |
+| DS-010 | `STOPSIGNAL SIGTERM` MUST be declared explicitly, even though it is Docker's default. | minor | all | platform-infrastructure | active |
+| DS-011 | A caller that declares (or structurally has - see DS-013) the `db-owner` capability MUST build `./cmd/dbtool` into an image binary, COPY it into the runtime stage, and carry the marker comment `# dbtool binary path: /app/<binary>`. | critical | db-owner | platform-architecture | active |
+| DS-012 | A caller that declares the `seed` capability SHOULD build/ship a seed binary with the standard marker. This is intentionally ADVISORY, not a hard gate: seed-contract- check.yml is the authoritative, hard-enforcing check for the full seeding contract (binary + data tree + placeholder-only qualified envs). This control exists only so the two checks' findings can be compared, never to duplicate seed-contract-check.yml's enforcement. | minor | seed | platform-infrastructure | active |
+| DS-013 | The `--capabilities` the caller declares MUST match what the repo structurally contains: `db-owner` iff go.mod requires a `*-core-postgres` module; `seed` iff `cmd/seed` exists; `backfill` iff `cmd/backfill` exists; `canary` iff `cmd/canary` exists. | critical | all | platform-architecture | active |
+| DS-014 | No `sqlc generate`, `protoc`/`buf generate`, `swag init`, or `openapi-generator` may run inside the Dockerfile. Generated code is committed; the image only compiles it. | critical | all | platform-architecture | active |
+| DS-015 | Use `COPY`, never `ADD` (ADD's implicit remote-URL-fetch and auto-extract behavior is unpinned, unaudited functionality this standard does not permit). | minor | all | platform-security | active |
+| DS-016 | A Dockerfile MUST NOT declare an ARG outside the set named in dockerfile-version-matrix.yaml `dockerfile_args` for anything that pins a tool/image/language version. | major | all | platform-infrastructure | active |
+| DS-017 | Private Go module credentials MUST be supplied via `--mount=type=secret,id=gh_token` and MUST NOT appear as a plain `ARG`/`ENV` or be baked into any layer. | critical | all | platform-security | active |
+| DS-018 | `apk add` in the builder stage installs only from {ca-certificates, git, tzdata}; in the runtime stage, only from {ca-certificates, tzdata, wget}. Any other package requires an ADR amendment (recorded in the version matrix). | minor | all | platform-security | active |
+
+<!-- END dockerfile-standard-controls -->
 
 ## Versioning
 

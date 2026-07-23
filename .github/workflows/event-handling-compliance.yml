@@ -1,0 +1,82 @@
+name: Reusable Event Handling Compliance
+
+# Central, single-source event-handling compliance gate for the coderaxis
+# platform. Consumed by every service repo via a thin caller (see README,
+# "Reusable workflows"):
+#
+#   jobs:
+#     event-handling-compliance:
+#       uses: coderaxis/github-actions/.github/workflows/event-handling-compliance.yml@v1
+#       with:
+#         role: P                        # P | H | DK | Hybrid | E | Bridge
+#         # allowed_topics: "inboxxhq.chat.messages"   # required for DK/Hybrid
+#
+# What it does (single source of truth — change here, roll the @v1 tag, never
+# edit ~40 service repos). Policy SSOT:
+# services/ENTERPRISE_NOTIFICATION_PATTERN.md §7 (per-family ownership matrix)
+# and §8 (anti-patterns) — this workflow is the EXECUTABLE form of that policy:
+#   1. role=P/H (owns Postgres): a raw Kafka producer anywhere in the repo is a
+#      hard failure — domain events must flow exclusively through the
+#      transactional outbox (platform-shared-go/outbox) + Debezium CDC.
+#   2. role=DK/Hybrid (no Postgres, or a named latency-critical stream): a
+#      direct producer is allowed, but MUST reference the canonical
+#      platform-shared-go/messaging/kafka envelope/topic registry, and every
+#      hardcoded topic string found must be in the declared `allowed_topics`.
+#   3. role=E/Bridge: no producer restriction (true exception / the sanctioned
+#      CDC-polling canonicalizer).
+#   4. Consumer-side: reports (warning, non-blocking) any raw
+#      sarama.NewConsumerGroup not wrapped by the shared
+#      events.EnterpriseConsumer (retry/DLQ/tracing/health).
+# Runs the SSOT scripts/event-compliance.sh against the caller — pure static
+# analysis, no DB/broker needed, so this job is fast and dependency-free.
+#
+# Versioning: consumers pin @v1 (moving major tag). Breaking changes bump @v2.
+
+on:
+  workflow_call:
+    inputs:
+      role:
+        description: "This repo's family role per ENTERPRISE_NOTIFICATION_PATTERN.md §7: P (owns Postgres, outbox-only) | H (notification hub, outbox-only) | DK (no Postgres, direct-Kafka producer) | Hybrid (owns Postgres AND one named latency-critical direct-Kafka stream) | E (true exception, no events) | Bridge (the sanctioned CDC-polling canonicalizer, e.g. event-publisher-core)."
+        required: true
+        type: string
+      allowed_topics:
+        description: "Comma-separated Kafka topic string(s) this repo's direct producer(s) may publish to (required when role is DK or Hybrid; must match a platform-shared-go/messaging/kafka topics.go constant value)."
+        required: false
+        type: string
+        default: ""
+      actions_ref:
+        description: "Ref of coderaxis/github-actions providing the SSOT script (defaults to the moving major tag)."
+        required: false
+        type: string
+        default: v1
+      runs_on:
+        description: "runs-on label for the job."
+        required: false
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  event-handling-compliance:
+    name: Event handling compliance
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout service (caller)
+        uses: actions/checkout@v4
+
+      - name: Checkout central SSOT (event-compliance script)
+        uses: actions/checkout@v4
+        with:
+          repository: coderaxis/github-actions
+          ref: ${{ inputs.actions_ref }}
+          path: .coderaxis-ci
+
+      - name: Event handling compliance
+        shell: bash
+        env:
+          ROLE: ${{ inputs.role }}
+          ALLOWED_TOPICS: ${{ inputs.allowed_topics }}
+        run: bash .coderaxis-ci/scripts/event-compliance.sh

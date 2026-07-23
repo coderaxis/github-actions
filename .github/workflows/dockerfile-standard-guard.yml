@@ -1,0 +1,72 @@
+name: Dockerfile Standard Guard
+
+# Self-CI governance for the Dockerfile-standard control catalog itself: validates the
+# catalog schema, keeps the checker's control docs in sync, and dry-runs the checker
+# against its own canonical template so a catalog/checker change that breaks the template
+# is caught here, not fleet-wide.
+#
+# Policy SSOT: ADR-0072 (Enterprise Dockerfile Standard). This is the Dockerfile-standard
+# twin of delivery-model-guard.yml.
+
+on:
+  push:
+    paths:
+      - "templates/Dockerfile.service"
+      - ".github/workflows/dockerfile-standard.yml"
+      - ".github/workflows/dockerfile-standard-guard.yml"
+      - "scripts/check-dockerfile-standard.py"
+      - "controls/dockerfile-standard.yaml"
+      - "README.md"
+  pull_request:
+    paths:
+      - "templates/Dockerfile.service"
+      - ".github/workflows/dockerfile-standard.yml"
+      - ".github/workflows/dockerfile-standard-guard.yml"
+      - "scripts/check-dockerfile-standard.py"
+      - "controls/dockerfile-standard.yaml"
+      - "README.md"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dockerfile-standard-guard:
+    name: Catalog + template self-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install checker dependency
+        run: python3 -m pip install --upgrade PyYAML
+
+      - name: Validate control catalog schema
+        run: |
+          python3 scripts/check-dockerfile-standard.py --format markdown > /dev/null
+          echo "control catalog schema OK"
+
+      - name: Verify control docs are in sync with the catalog
+        run: python3 scripts/check-dockerfile-standard.py --verify-docs README.md
+
+      - name: Prepare a filled-in copy of the canonical template for a self-check
+        run: |
+          sed \
+            -e 's/__SERVICE_NAME__/example/g' \
+            -e 's/__REPO_NAME__/inboxxhq-example-service/g' \
+            -e 's/__CAPABILITY_LIST__/http-api/g' \
+            -e 's/__SERVICE_PORT__/4000/g' \
+            templates/Dockerfile.service > /tmp/Dockerfile.instantiated
+
+      - name: Self-check the instantiated template (http-api capability only)
+        run: |
+          python3 scripts/check-dockerfile-standard.py \
+            /tmp/Dockerfile.instantiated \
+            --capabilities http-api \
+            --fail-on major

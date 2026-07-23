@@ -1,0 +1,398 @@
+# Enterprise Dockerfile Standard control catalog (declarative policy-as-code).
+#
+# This is the single source of WHICH invariants the Dockerfile standard enforces and their
+# metadata: policy, rationale, remediation, severity, capability scope, ownership, and
+# lifecycle. The catalog defines POLICY ONLY - it never describes how detection is
+# implemented. Each control's `detector` key binds it to an implementation in
+# scripts/check-dockerfile-standard.py, which may evolve WITHOUT any change to this catalog.
+# This mirrors controls/delivery-model.yaml.
+#
+# `applies_to_capabilities`: [] means the control applies to EVERY caller regardless of
+# declared capability (e.g. "no root execution" is universal). A non-empty list means the
+# control is only evaluated for callers that declare at least one of those capabilities
+# (evaluated via --capabilities, mirroring event-handling-compliance.yml's `role` input).
+#
+# Control IDs (DS-NNN) are STABLE and permanent — see controls/delivery-model.yaml header
+# for the full ID/lifecycle discipline; it applies identically here.
+#
+# Policy SSOT (architecture is owned by the ADR; this catalog only enforces it):
+#   ADR-0072 - Enterprise Dockerfile Standard
+#   Standard - docs/core-docs/standards/infrastructure/dockerfile-standard.md
+#   Version matrix  - docs/core-docs/standards/infrastructure/dockerfile-version-matrix.yaml
+#   Capability matrix - docs/core-docs/standards/infrastructure/dockerfile-capability-matrix.yaml
+#
+# Deliberate non-duplication: seeding invariants (binary marker, data-tree COPY, placeholder-
+# only qualified envs) are ALREADY hard-enforced by seed-contract-check.yml. DS-012 here is
+# an ADVISORY cross-check only (so the two checks cannot silently diverge), never a second
+# hard gate for the same fact - "no duplicate logic" is a design requirement, not a slogan.
+
+version: 1
+domain: dockerfile-standard
+policy_ssot:
+  - ADR-0072
+
+controls:
+  - id: DS-001
+    title: Dockerfile declares the canonical two-stage layout
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      Exactly one builder stage named `builder` (golang base) and exactly one unnamed
+      runtime stage (alpine base). No third stage.
+    rationale: >-
+      A hidden third stage (codegen/test) is exactly the kind of silent functional
+      difference this standard exists to eliminate; stage count and naming must be
+      mechanically verifiable, not a convention people remember.
+    remediation: >-
+      Collapse to `FROM ... AS builder` + one final `FROM ...` runtime stage. Move any
+      codegen/test step out of the Dockerfile and into CI, committing its output.
+    detector: two_stage_layout
+    refs: [ADR-0072]
+
+  - id: DS-002
+    title: Builder cross-compiles FROM the build platform, never QEMU-emulated
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: major
+    applies_to_capabilities: []
+    policy: >-
+      The builder stage's FROM MUST use `--platform=$BUILDPLATFORM`, and the build MUST set
+      `GOARCH=${TARGETARCH}` (or equivalent) so the target architecture is cross-compiled,
+      not emulated.
+    rationale: >-
+      QEMU-emulated Go builds are dramatically slower and have historically been a source of
+      flaky multi-arch CI; cross-compilation is strictly better and already fleet-standard.
+    remediation: >-
+      Add `--platform=$BUILDPLATFORM` to the builder `FROM` and build with
+      `GOARCH=${TARGETARCH}`.
+    detector: cross_compile_builder
+    refs: [ADR-0072]
+
+  - id: DS-003
+    title: Base image versions match the centrally pinned version matrix
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: major
+    applies_to_capabilities: []
+    policy: >-
+      The builder image tag and runtime image tag MUST equal the values pinned in
+      dockerfile-version-matrix.yaml (currently `1.26-alpine3.19` / `3.19`). A Dockerfile
+      MUST NOT pin a different version independently, and MUST NOT use a floating tag
+      that omits the Alpine sub-version (e.g. bare `golang:1.26-alpine`).
+    rationale: >-
+      Centralized version control is the entire point: a fleet-wide bump must be a one-line
+      change to the version matrix, not ~40 individual Dockerfile edits, and every image
+      must be built from the exact same, reproducible base.
+    remediation: >-
+      Pin `FROM ...golang:1.26-alpine3.19 AS builder` and `FROM ...alpine:3.19` exactly, or
+      thread them through the ARGs in templates/Dockerfile.service with the matrix's
+      defaults - never a hand-picked value.
+    detector: version_matrix_pinned
+    refs: [ADR-0072]
+
+  - id: DS-004
+    title: No floating/no latest tags anywhere in the Dockerfile
+    owner: platform-security
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      No `FROM ...:latest` (implicit or explicit) and no unpinned `FROM` (a bare
+      `image_name` with no tag at all, which Docker resolves to `:latest`).
+    rationale: >-
+      `:latest` breaks reproducibility and is a classic supply-chain footgun - the same
+      Dockerfile can silently produce a different image tomorrow.
+    remediation: >-
+      Pin an explicit, version-matrix-sourced tag on every FROM.
+    detector: no_latest_tag
+    refs: [ADR-0072]
+
+  - id: DS-005
+    title: Runtime stage runs as a numeric, pinned non-root UID:GID
+    owner: platform-security
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      The runtime stage MUST create its user with an explicit, pinned numeric UID/GID
+      (matching dockerfile-version-matrix.yaml `runtime_user`, currently 10001:10001) and
+      the final `USER` instruction MUST reference that numeric UID:GID, never a bare
+      symbolic username with no numeric pin, and never root (UID 0 / no USER instruction
+      at all).
+    rationale: >-
+      A symbolic user created via `adduser -D` with no numeric pin is non-deterministic
+      across image rebuilds and cannot be referenced by a Kubernetes
+      securityContext.runAsUser/runAsGroup pin - i.e. defense-in-depth at the orchestration
+      layer silently cannot be applied.
+    remediation: >-
+      addgroup -g ${RUNTIME_GID} -S appuser && adduser -u ${RUNTIME_UID} -S -G appuser ...;
+      then `USER ${RUNTIME_UID}:${RUNTIME_GID}`.
+    detector: numeric_nonroot_user
+    refs: [ADR-0072]
+
+  - id: DS-006
+    title: HEALTHCHECK required for http-api / gateway capability
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: major
+    applies_to_capabilities: [http-api, gateway]
+    policy: >-
+      A HEALTHCHECK instruction MUST be present, and its target port MUST equal the port in
+      EXPOSE.
+    rationale: >-
+      An HTTP service with no HEALTHCHECK gives the orchestrator no way to detect a hung-
+      but-still-running process; port drift between EXPOSE and HEALTHCHECK is a silent
+      readiness-probe bug.
+    remediation: >-
+      Add the standard HEALTHCHECK block targeting the same port as EXPOSE.
+    detector: healthcheck_present_and_consistent
+    refs: [ADR-0072]
+
+  - id: DS-007
+    title: worker capability MUST NOT assume an HTTP HEALTHCHECK
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: minor
+    applies_to_capabilities: [worker]
+    policy: >-
+      A `worker`-only caller (no `http-api`) MUST NOT use an HTTP HEALTHCHECK (no HTTP port
+      is bound) but MUST still declare SOME HEALTHCHECK (process/file/socket-based) -
+      omitting HEALTHCHECK entirely is not an acceptable substitute.
+    rationale: >-
+      "No HTTP" is not "no health signal"; a worker with zero health check is
+      indistinguishable from a hung worker to the orchestrator.
+    remediation: >-
+      Add a non-HTTP HEALTHCHECK (e.g. a liveness file touched on each successful poll
+      loop, checked via `test -f`/`find -mmin`).
+    detector: worker_healthcheck_not_http
+    refs: [ADR-0072]
+
+  - id: DS-008
+    title: Required OCI labels present on the runtime stage
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: major
+    applies_to_capabilities: []
+    policy: >-
+      The runtime stage MUST carry LABEL org.opencontainers.image.title, .source, .vendor,
+      .licenses, .revision, .created, and com.coderaxis.capabilities.
+    rationale: >-
+      Zero Dockerfiles in the fleet carry any OCI label today; a running container cannot
+      currently answer "what is this, where did it come from, what can it do" without a
+      repo checkout. This is the single most impactful fleet-wide gap the audit found.
+    remediation: >-
+      Copy the LABEL block from templates/Dockerfile.service verbatim, filling in the
+      per-repo values.
+    detector: required_oci_labels
+    refs: [ADR-0072]
+
+  - id: DS-009
+    title: Exec-form CMD/ENTRYPOINT; exactly one foreground process
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      CMD (or ENTRYPOINT) MUST be JSON exec form (`["./binary"]`), never a shell string.
+      No ENTRYPOINT shell-script wrapper (`entrypoint.sh`) is permitted - the compiled
+      binary IS the entrypoint.
+    rationale: >-
+      Shell-form CMD/ENTRYPOINT and shell-script wrappers interpose a shell as PID 1, which
+      can swallow SIGTERM and hide graceful-shutdown bugs; exec form delivers signals
+      directly to the application.
+    remediation: >-
+      Use `CMD ["./service-binary"]`. If startup logic is needed, put it in the Go binary's
+      own `main()`, not a shell script.
+    detector: exec_form_cmd
+    refs: [ADR-0072]
+
+  - id: DS-010
+    title: STOPSIGNAL declared explicitly
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: minor
+    applies_to_capabilities: []
+    policy: >-
+      `STOPSIGNAL SIGTERM` MUST be declared explicitly, even though it is Docker's
+      default.
+    rationale: >-
+      Explicit over implicit - a reader should not have to know Docker's default to know
+      what signal a graceful shutdown responds to.
+    remediation: >-
+      Add `STOPSIGNAL SIGTERM`.
+    detector: stopsignal_declared
+    refs: [ADR-0072]
+
+  - id: DS-011
+    title: db-owner capability ships a dbtool binary
+    owner: platform-architecture
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: [db-owner]
+    policy: >-
+      A caller that declares (or structurally has - see DS-013) the `db-owner` capability
+      MUST build `./cmd/dbtool` into an image binary, COPY it into the runtime stage, and
+      carry the marker comment `# dbtool binary path: /app/<binary>`.
+    rationale: >-
+      Without the dbtool binary shipped in the image, boot-time schema-compatibility
+      verification and out-of-band migration application (ADR-0062) have no binary to run
+      against this release's exact compiled schema expectations - a silent capability gap
+      the fleet audit found live in two services.
+    remediation: >-
+      Add the dbtool build/COPY block from templates/Dockerfile.service.
+    detector: dbowner_ships_dbtool
+    refs: [ADR-0072, ADR-0062]
+
+  - id: DS-012
+    title: seed capability ships a seed binary (advisory cross-check only)
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: minor
+    applies_to_capabilities: [seed]
+    policy: >-
+      A caller that declares the `seed` capability SHOULD build/ship a seed binary with the
+      standard marker. This is intentionally ADVISORY, not a hard gate: seed-contract-
+      check.yml is the authoritative, hard-enforcing check for the full seeding contract
+      (binary + data tree + placeholder-only qualified envs). This control exists only so
+      the two checks' findings can be compared, never to duplicate seed-contract-check.yml's
+      enforcement.
+    rationale: >-
+      "No duplicate logic" - a second hard gate for the same fact doubles the maintenance
+      burden and risks the two checks drifting to different conclusions.
+    remediation: >-
+      Run seed-contract-check.yml for the authoritative fix; this control's finding is
+      informational.
+    detector: seed_ships_seed_binary
+    refs: [ADR-0072]
+
+  - id: DS-013
+    title: Declared capability set matches structural reality
+    owner: platform-architecture
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      The `--capabilities` the caller declares MUST match what the repo structurally
+      contains: `db-owner` iff go.mod requires a `*-core-postgres` module; `seed` iff
+      `cmd/seed` exists; `backfill` iff `cmd/backfill` exists; `canary` iff `cmd/canary`
+      exists.
+    rationale: >-
+      A stale or wrong declaration is itself the failure mode this whole capability model
+      exists to prevent - the declaration is a claim CI must verify, not an override CI
+      trusts blindly.
+    remediation: >-
+      Update the `capabilities:` input in .github/workflows/dockerfile-standard.yml (this
+      repo) AND dockerfile-capability-matrix.yaml (coderaxis/microservices) in the same PR.
+    detector: capability_declaration_matches_reality
+    refs: [ADR-0072]
+
+  - id: DS-014
+    title: No build-time code generation in the Dockerfile
+    owner: platform-architecture
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      No `sqlc generate`, `protoc`/`buf generate`, `swag init`, or `openapi-generator` may
+      run inside the Dockerfile. Generated code is committed; the image only compiles it.
+    rationale: >-
+      Build-time codegen makes the image non-reproducible from source alone (depends on
+      network-fetched generator versions) and hides generated-code drift from code review.
+    remediation: >-
+      Remove the codegen step from the Dockerfile; run it in CI (or locally) and commit the
+      output.
+    detector: no_build_time_codegen
+    refs: [ADR-0072]
+
+  - id: DS-015
+    title: No ADD instruction (COPY only)
+    owner: platform-security
+    scope: caller-workflow
+    status: active
+    severity: minor
+    applies_to_capabilities: []
+    policy: >-
+      Use `COPY`, never `ADD` (ADD's implicit remote-URL-fetch and auto-extract behavior is
+      unpinned, unaudited functionality this standard does not permit).
+    rationale: >-
+      ADD's "helpful" auto-extraction/remote-fetch behavior is exactly the kind of implicit,
+      hard-to-audit functionality this standard exists to eliminate.
+    remediation: >-
+      Replace `ADD` with `COPY`.
+    detector: no_add_instruction
+    refs: [ADR-0072]
+
+  - id: DS-016
+    title: No freeform version-bearing build ARGs
+    owner: platform-infrastructure
+    scope: caller-workflow
+    status: active
+    severity: major
+    applies_to_capabilities: []
+    policy: >-
+      A Dockerfile MUST NOT declare an ARG outside the set named in
+      dockerfile-version-matrix.yaml `dockerfile_args` for anything that pins a
+      tool/image/language version.
+    rationale: >-
+      A per-repo, independently-named version ARG is exactly how "no Dockerfile may invent
+      its own pattern" gets quietly violated - the ARG name itself becomes an unauthorized
+      escape hatch.
+    remediation: >-
+      Use the named ARGs from templates/Dockerfile.service; add a new one to the version
+      matrix (with an ADR) before introducing it in any Dockerfile.
+    detector: no_freeform_version_args
+    refs: [ADR-0072]
+
+  - id: DS-017
+    title: BuildKit secret mount for private-module credentials; no baked token
+    owner: platform-security
+    scope: caller-workflow
+    status: active
+    severity: critical
+    applies_to_capabilities: []
+    policy: >-
+      Private Go module credentials MUST be supplied via `--mount=type=secret,id=gh_token`
+      and MUST NOT appear as a plain `ARG`/`ENV` or be baked into any layer.
+    rationale: >-
+      An ARG/ENV-supplied token is embedded in the image's build history/layers even if
+      later "removed" - a classic secret-leak vector this fleet has correctly avoided so
+      far; this control keeps it that way.
+    remediation: >-
+      Use the `--mount=type=secret,id=gh_token` RUN block from templates/Dockerfile.service.
+    detector: secret_mount_for_credentials
+    refs: [ADR-0072]
+
+  - id: DS-018
+    title: Package installs are pinned to the approved allow-list
+    owner: platform-security
+    scope: caller-workflow
+    status: active
+    severity: minor
+    applies_to_capabilities: []
+    policy: >-
+      `apk add` in the builder stage installs only from {ca-certificates, git, tzdata}; in
+      the runtime stage, only from {ca-certificates, tzdata, wget}. Any other package
+      requires an ADR amendment (recorded in the version matrix).
+    rationale: >-
+      An unreviewed package addition is attack-surface creep by a thousand small PRs; an
+      explicit allow-list makes every addition a deliberate, reviewed decision.
+    remediation: >-
+      Remove the unlisted package, or get an ADR amendment adding it to the allow-list.
+    detector: package_allowlist
+    refs: [ADR-0072]

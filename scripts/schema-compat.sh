@@ -41,6 +41,19 @@
 # Whichever path runs must leave the DB migrated to HEAD; the outbox verifier
 # then introspects the live table and fails closed on ANY semantic drift from
 # the canonical contract (RFC-0032 / ADR-0069).
+#
+# Schema-path/layout guardrail (Schema Migration Standard §1/§12): every
+# *-core-postgres repo's migration SQL MUST live at the exact path
+# schema/migrations/ (sqlc query files under sql/queries/ are the one other
+# allowed .sql location — not a migration). A repo that owns any DDL at all
+# must ship AT LEAST the paired schema/migrations/000001_init.up.sql +
+# 000001_init.down.sql baseline (every migration is a split .up.sql/.down.sql
+# pair — no bare/combined .sql files). Additional forward migrations
+# (000002_*, 000003_*, ...) are explicitly ALLOWED and expected to accumulate
+# over time — this guardrail only fixes the PATH and the INIT PAIR, it never
+# caps the migration count. A repo with zero .sql files anywhere is exempt
+# (a legitimate no-DDL module, e.g. a storage adapter with no table DDL of its
+# own). This check runs first and fails fast, before any DB is touched.
 # =============================================================================
 set -euo pipefail
 
@@ -118,6 +131,92 @@ static_lint() {
   [[ "${found}" -eq 1 ]] || log "no migrations found; schema compatibility not required for this repo"
 }
 
+# check_schema_layout — fleet-wide path + naming consistency guardrail.
+# Fails closed (before touching any DB) on:
+#   1. any *.sql file living anywhere other than the allowed locations:
+#        - schema/migrations/**  (the migration chain)
+#        - sql/queries/**        (sqlc query source)
+#        - schema/seed*.sql      (dev/role seed data — a distinct, sanctioned
+#                                 concern from the migration chain, e.g.
+#                                 seed_dev.sql / seed_roles.sql; NOT a
+#                                 migration and never applies schema DDL)
+#        - seed/**               (the platform seeding-standard tree)
+#        - testdata/**           (idiomatic Go test fixtures, e.g. a
+#                                 generated sqlc test snapshot)
+#      Anything else — e.g. a stray flat schema/001_init.sql or schema/schema.sql
+#      full-dump left over from before a squash, a service-local migrations/
+#      copy, etc. — is a violation: it is either an actively-diverging second
+#      SSOT or dead legacy cruft, and either way must not exist.
+#   2. schema/migrations/ existing without the required baseline pair
+#      000001_init.up.sql + 000001_init.down.sql.
+#   3. any file under schema/migrations/ that isn't a well-formed
+#      NNNNNN_name.up.sql / NNNNNN_name.down.sql, or an .up.sql with no
+#      matching .down.sql (and vice versa).
+# Additional forward migrations beyond 000001 are explicitly welcome — this
+# never caps how many migrations a repo may accumulate.
+check_schema_layout() {
+  log "checking schema/migrations path + init-pair layout"
+
+  local stray=() f
+  while IFS= read -r -d '' f; do
+    stray+=("${f}")
+  done < <(find . -type f -name '*.sql' \
+    -not -path './schema/migrations/*' \
+    -not -path './sql/queries/*' \
+    -not -path './schema/seed*.sql' \
+    -not -path './seed/*' \
+    -not -path './testdata/*' \
+    -not -path '*/testdata/*' \
+    -not -path './.schema-compat-gen/*' \
+    -not -path './.git/*' \
+    -print0)
+
+  if [[ "${#stray[@]}" -gt 0 ]]; then
+    echo "::error::stray .sql file(s) outside the canonical schema/migrations/ (migration chain) and sql/queries/ (sqlc queries) paths — every *-core-postgres repo's schema lives at EXACTLY schema/migrations/:"
+    printf '  %s\n' "${stray[@]}"
+    exit 1
+  fi
+
+  if [[ ! -d schema/migrations ]]; then
+    log "no schema/migrations/ directory and no stray .sql found; treating as a legitimate no-DDL module (exempt)"
+    return
+  fi
+
+  if [[ ! -f schema/migrations/000001_init.up.sql ]]; then
+    echo "::error::schema/migrations/ exists but is missing the required baseline schema/migrations/000001_init.up.sql"
+    exit 1
+  fi
+  if [[ ! -f schema/migrations/000001_init.down.sql ]]; then
+    echo "::error::schema/migrations/ exists but is missing schema/migrations/000001_init.down.sql — every migration ships as a split .up.sql/.down.sql pair, never a lone .up.sql"
+    exit 1
+  fi
+
+  local bad=0
+  while IFS= read -r -d '' f; do
+    local base name
+    name="$(basename "${f}")"
+    if [[ "${name}" == *.up.sql ]]; then
+      base="${f%.up.sql}"
+      if [[ ! -f "${base}.down.sql" ]]; then
+        echo "::error file=${f}::.up.sql has no matching .down.sql"
+        bad=1
+      fi
+    elif [[ "${name}" == *.down.sql ]]; then
+      base="${f%.down.sql}"
+      if [[ ! -f "${base}.up.sql" ]]; then
+        echo "::error file=${f}::.down.sql has no matching .up.sql"
+        bad=1
+      fi
+    else
+      echo "::error file=${f}::does not match the NNNNNN_name.up.sql / NNNNNN_name.down.sql convention"
+      bad=1
+    fi
+  done < <(find schema/migrations -maxdepth 1 -type f -name '*.sql' -print0)
+
+  [[ "${bad}" -eq 0 ]] || exit 1
+  log "schema/migrations layout OK"
+}
+
 apply_migrations() {
   if [[ -n "${MIGRATE_CMD_OVERRIDE}" ]]; then
     log "migrate via caller-provided MIGRATE_CMD override"
@@ -173,6 +272,7 @@ verify_outbox() {
   )
 }
 
+check_schema_layout
 apply_migrations
 verify_outbox
 log "schema-compatibility OK"
